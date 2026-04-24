@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         vidokoun
 // @namespace    http://tampermonkey.net/
-// @version      1.0.5
-// @description  Lazy-loads videos and extracts raw MP4s from Twitter/X for okoun.cz
+// @version      1.0.6
+// @description  Lazy-loads videos, extracts Twitter MP4s, and adds fallback source links
 // @author       hanenashi
 // @match        *://*.okoun.cz/*
 // @updateURL    https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js
@@ -16,7 +16,7 @@
     const services = [
         {
             name: 'YouTube',
-            regex: /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i,
+            regex: /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/|youtube\.com\/shorts\/)([^"&?\/\s]{11})/i,
             getEmbedUrl: (id) => `https://www.youtube.com/embed/${id}?autoplay=1`, 
             style: 'aspect-ratio: 16/9;'
         },
@@ -28,18 +28,15 @@
         },
         {
             name: 'Twitter',
-            // Adjusted regex to capture both the username (match[1]) and the status ID (match[2])
             regex: /(?:twitter\.com|x\.com)\/([a-zA-Z0-9_]+)\/status\/(\d+)/i,
-            style: 'aspect-ratio: 16/9; background: #000;', // Default to video ratio
+            style: 'aspect-ratio: 16/9; background: #000;', 
             customAction: async (placeholderNode, match) => {
                 const username = match[1];
                 const id = match[2];
                 try {
-                    // Fetch the raw media data via the public VxTwitter API
                     const res = await fetch(`https://api.vxtwitter.com/${username}/status/${id}`);
                     const data = await res.json();
                     
-                    // Look for the raw MP4 URL in the response
                     const videoUrl = data.mediaURLs?.find(url => url.includes('.mp4'));
                     
                     if (videoUrl) {
@@ -53,7 +50,6 @@
                         throw new Error('No video found in tweet');
                     }
                 } catch (e) {
-                    // Fallback to the heavy Twitter iframe if it's just an image or the fetch fails
                     const iframe = document.createElement('iframe');
                     iframe.src = `https://platform.twitter.com/embed/Tweet.html?id=${id}`;
                     iframe.style.cssText = 'width: 100%; height: 450px; resize: vertical; border: none; border-radius: 4px; background: white;';
@@ -76,6 +72,7 @@
     ];
 
     const createPlaceholder = (service, match) => {
+        // Quick ternary to handle standard regex vs Twitter's dual-group regex
         const id = service.name === 'Twitter' ? match[2] : match[1];
         
         const placeholder = document.createElement('div');
@@ -126,8 +123,9 @@
                     link.classList.add('vid-embedded'); 
                     
                     const wrapper = document.createElement('div');
-                    wrapper.style.cssText = 'margin: 12px 0; max-width: 550px;';
+                    wrapper.style.cssText = 'margin: 12px 0; max-width: 550px; display: flex; flex-direction: column;';
                     
+                    // 1. Inject the player/placeholder
                     if (service.isNative) {
                         const video = document.createElement('video');
                         video.src = match[1];
@@ -139,9 +137,20 @@
                         const placeholder = createPlaceholder(service, match);
                         wrapper.appendChild(placeholder);
                     }
+
+                    // 2. Inject the fallback source link below the player
+                    const sourceLink = document.createElement('a');
+                    sourceLink.href = url;
+                    sourceLink.target = '_blank';
+                    sourceLink.innerHTML = `[ ↗ Open original ${service.name} link ]`;
+                    sourceLink.style.cssText = 'align-self: flex-end; margin-top: 6px; font-size: 11px; color: #888; text-decoration: none; font-family: sans-serif;';
+                    sourceLink.onmouseenter = () => sourceLink.style.color = '#ccc';
+                    sourceLink.onmouseleave = () => sourceLink.style.color = '#888';
+                    wrapper.appendChild(sourceLink);
                     
                     link.parentNode.insertBefore(wrapper, link.nextSibling);
                     
+                    // Hide original inline link if it wraps an image thumbnail
                     if (link.querySelector('img')) {
                         link.style.display = 'none';
                     }
