@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         vidokoun
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  Embeds YouTube and Vimeo links directly into okoun.cz posts
-// @author       kokochan
+// @author       hanenashi
 // @match        *://*.okoun.cz/*
+// @updateURL    https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js
+// @downloadURL  https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js
 // @grant        none
 // ==/UserScript==
 
@@ -50,6 +52,12 @@
                     
                     // Place the iframe container right below the original text link
                     link.parentNode.insertBefore(wrapper, link.nextSibling);
+                    
+                    // Hide the original link if it wraps an image thumbnail
+                    if (link.querySelector('img')) {
+                        link.style.display = 'none';
+                    }
+                    
                     break; 
                 }
             }
