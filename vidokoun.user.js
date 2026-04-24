@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         vidokoun
 // @namespace    http://tampermonkey.net/
-// @version      1.0.4
-// @description  Lazy-loads YouTube, Vimeo, Twitter, IG, and direct MP4 links in okoun.cz posts
+// @version      1.0.5
+// @description  Lazy-loads videos and extracts raw MP4s from Twitter/X for okoun.cz
 // @author       hanenashi
 // @match        *://*.okoun.cz/*
 // @updateURL    https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js
@@ -13,7 +13,6 @@
 (function() {
     'use strict';
 
-    // Video/Social service regex patterns, embed URLs, and custom aspect ratios
     const services = [
         {
             name: 'YouTube',
@@ -29,9 +28,38 @@
         },
         {
             name: 'Twitter',
-            regex: /(?:twitter\.com|x\.com)\/[a-zA-Z0-9_]+\/status\/(\d+)/i,
-            getEmbedUrl: (id) => `https://platform.twitter.com/embed/Tweet.html?id=${id}`,
-            style: 'height: 450px; resize: vertical;'
+            // Adjusted regex to capture both the username (match[1]) and the status ID (match[2])
+            regex: /(?:twitter\.com|x\.com)\/([a-zA-Z0-9_]+)\/status\/(\d+)/i,
+            style: 'aspect-ratio: 16/9; background: #000;', // Default to video ratio
+            customAction: async (placeholderNode, match) => {
+                const username = match[1];
+                const id = match[2];
+                try {
+                    // Fetch the raw media data via the public VxTwitter API
+                    const res = await fetch(`https://api.vxtwitter.com/${username}/status/${id}`);
+                    const data = await res.json();
+                    
+                    // Look for the raw MP4 URL in the response
+                    const videoUrl = data.mediaURLs?.find(url => url.includes('.mp4'));
+                    
+                    if (videoUrl) {
+                        const video = document.createElement('video');
+                        video.src = videoUrl;
+                        video.controls = true;
+                        video.autoplay = true;
+                        video.style.cssText = `width: 100%; aspect-ratio: 16/9; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.2); background: #000;`;
+                        placeholderNode.replaceWith(video);
+                    } else {
+                        throw new Error('No video found in tweet');
+                    }
+                } catch (e) {
+                    // Fallback to the heavy Twitter iframe if it's just an image or the fetch fails
+                    const iframe = document.createElement('iframe');
+                    iframe.src = `https://platform.twitter.com/embed/Tweet.html?id=${id}`;
+                    iframe.style.cssText = 'width: 100%; height: 450px; resize: vertical; border: none; border-radius: 4px; background: white;';
+                    placeholderNode.replaceWith(iframe);
+                }
+            }
         },
         {
             name: 'Instagram',
@@ -42,12 +70,14 @@
         {
             name: 'Direct MP4',
             regex: /(https?:\/\/[^\s]+\.mp4(?:\?.*)?)/i,
-            isNative: true, // Flag to use native <video> instead of an iframe
+            isNative: true, 
             style: 'aspect-ratio: 16/9; background: #000; max-height: 550px;'
         }
     ];
 
-    const createPlaceholder = (service, id) => {
+    const createPlaceholder = (service, match) => {
+        const id = service.name === 'Twitter' ? match[2] : match[1];
+        
         const placeholder = document.createElement('div');
         placeholder.style.cssText = `width: 100%; ${service.style} background-color: #1a1a1a; border-radius: 4px; display: flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.2); transition: background 0.2s ease; background-position: center; background-size: cover;`;
         
@@ -57,21 +87,28 @@
 
         const playBtn = document.createElement('div');
         playBtn.innerHTML = `▶ Load ${service.name}`;
-        playBtn.style.cssText = 'background: rgba(0, 0, 0, 0.75); color: #fff; padding: 10px 20px; border-radius: 20px; font-family: sans-serif; font-size: 13px; font-weight: bold; pointer-events: none; border: 1px solid rgba(255,255,255,0.2);';
+        playBtn.style.cssText = 'background: rgba(0, 0, 0, 0.75); color: #fff; padding: 10px 20px; border-radius: 20px; font-family: sans-serif; font-size: 13px; font-weight: bold; pointer-events: none; border: 1px solid rgba(255,255,255,0.2); transition: all 0.2s;';
         
         placeholder.onmouseenter = () => playBtn.style.background = 'rgba(255, 0, 0, 0.9)';
         placeholder.onmouseleave = () => playBtn.style.background = 'rgba(0, 0, 0, 0.75)';
 
         placeholder.appendChild(playBtn);
 
-        placeholder.addEventListener('click', function() {
-            const iframe = document.createElement('iframe');
-            iframe.src = service.getEmbedUrl(id);
-            iframe.style.cssText = `width: 100%; ${service.style} border: none; border-radius: 4px; background: white;`;
-            iframe.allowFullscreen = true;
-            iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture';
+        placeholder.addEventListener('click', async function() {
+            playBtn.innerHTML = `⏳ Loading...`;
+            playBtn.style.background = 'rgba(100, 100, 100, 0.9)';
             
-            this.replaceWith(iframe);
+            if (service.customAction) {
+                await service.customAction(this, match);
+            } else {
+                const iframe = document.createElement('iframe');
+                iframe.src = service.getEmbedUrl(id);
+                iframe.style.cssText = `width: 100%; ${service.style} border: none; border-radius: 4px; background: white;`;
+                iframe.allowFullscreen = true;
+                iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture';
+                
+                this.replaceWith(iframe);
+            }
         });
 
         return placeholder;
@@ -85,29 +122,26 @@
             
             for (const service of services) {
                 const match = url.match(service.regex);
-                if (match && match[1]) {
+                if (match) {
                     link.classList.add('vid-embedded'); 
                     
                     const wrapper = document.createElement('div');
                     wrapper.style.cssText = 'margin: 12px 0; max-width: 550px;';
                     
                     if (service.isNative) {
-                        // Native HTML5 video tag specifically for .mp4 links
                         const video = document.createElement('video');
                         video.src = match[1];
                         video.controls = true;
-                        video.preload = 'none'; // The crucial part: 0 bytes downloaded on page load
+                        video.preload = 'none'; 
                         video.style.cssText = `width: 100%; ${service.style} border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.2);`;
                         wrapper.appendChild(video);
                     } else {
-                        // Facade injection for iframe-based services
-                        const placeholder = createPlaceholder(service, match[1]);
+                        const placeholder = createPlaceholder(service, match);
                         wrapper.appendChild(placeholder);
                     }
                     
                     link.parentNode.insertBefore(wrapper, link.nextSibling);
                     
-                    // Hide original link if it wraps an image thumbnail
                     if (link.querySelector('img')) {
                         link.style.display = 'none';
                     }
