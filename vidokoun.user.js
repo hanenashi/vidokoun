@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         vidokoun
 // @namespace    http://tampermonkey.net/
-// @version      1.0.8
-// @description  Lazy-loads videos, extracts Twitter/X MP4s, tries GM blob loading, and falls back to Twitter iframe
+// @version      1.0.9
+// @description  Lazy-loads videos, extracts Twitter/X MP4s, tries GM blob loading, auto-cleans old blobs, and falls back to Twitter iframe
 // @author       hanenashi
 // @match        *://*.okoun.cz/*
 // @updateURL    https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js
@@ -19,6 +19,9 @@
 
     const DEBUG = false;
     const MAX_WIDTH = '550px';
+    const MAX_LOADED_TWITTER_BLOBS = 3;
+
+    const loadedTwitterBlobs = [];
 
     function log(...args) {
         if (DEBUG) console.log('[vidokoun]', ...args);
@@ -98,6 +101,34 @@
         return iframe;
     }
 
+    function registerTwitterBlobVideo(record) {
+        loadedTwitterBlobs.push(record);
+        cleanupTwitterBlobs();
+    }
+
+    function unregisterTwitterBlobVideo(record) {
+        const index = loadedTwitterBlobs.indexOf(record);
+        if (index !== -1) loadedTwitterBlobs.splice(index, 1);
+    }
+
+    function cleanupTwitterBlobs() {
+        while (loadedTwitterBlobs.length > MAX_LOADED_TWITTER_BLOBS) {
+            const oldest = loadedTwitterBlobs.shift();
+            if (oldest && typeof oldest.unload === 'function') {
+                oldest.unload();
+            }
+        }
+    }
+
+    function revokeAllTwitterBlobs() {
+        while (loadedTwitterBlobs.length) {
+            const item = loadedTwitterBlobs.shift();
+            if (item && typeof item.unload === 'function') {
+                item.unload(true);
+            }
+        }
+    }
+
     const services = [
         {
             name: 'YouTube',
@@ -115,7 +146,7 @@
             name: 'Twitter/X',
             regex: /(?:twitter\.com|x\.com)\/([a-zA-Z0-9_]+)\/status\/(\d+)/i,
             style: 'aspect-ratio: 16/9; background: #000;',
-            customAction: async (placeholderNode, match, originalUrl) => {
+            customAction: async (placeholderNode, match, originalUrl, service) => {
                 const username = match[1];
                 const id = match[2];
 
@@ -147,12 +178,46 @@
                         'background: #000;'
                     ].join(' ');
 
+                    let unloaded = false;
+                    const record = {
+                        blobUrl,
+                        video,
+                        unload: (pageLeaving = false) => {
+                            if (unloaded) return;
+                            unloaded = true;
+
+                            try {
+                                video.pause();
+                            } catch (e) {
+                                // ignore
+                            }
+
+                            video.removeAttribute('src');
+                            try {
+                                video.load();
+                            } catch (e) {
+                                // ignore
+                            }
+
+                            URL.revokeObjectURL(blobUrl);
+                            unregisterTwitterBlobVideo(record);
+
+                            if (!pageLeaving && video.isConnected) {
+                                const freshPlaceholder = createPlaceholder(service, match, originalUrl);
+                                video.replaceWith(freshPlaceholder);
+                            }
+                        }
+                    };
+
                     video.addEventListener('error', () => {
-                        URL.revokeObjectURL(blobUrl);
-                        video.replaceWith(makeTwitterIframe(id));
+                        record.unload(true);
+                        if (video.isConnected) {
+                            video.replaceWith(makeTwitterIframe(id));
+                        }
                     }, { once: true });
 
                     placeholderNode.replaceWith(video);
+                    registerTwitterBlobVideo(record);
                 } catch (e) {
                     log('Twitter/X GM blob load failed, falling back to iframe:', e);
                     placeholderNode.replaceWith(makeTwitterIframe(id));
@@ -172,14 +237,6 @@
             style: 'aspect-ratio: 16/9; background: #000; max-height: 550px;'
         }
     ];
-
-    function escapeAttr(str) {
-        return String(str)
-            .replace(/&/g, '&amp;')
-            .replace(/"/g, '&quot;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;');
-    }
 
     function isInsideVidokounNode(node) {
         if (!node || node.nodeType !== 1) return false;
@@ -244,7 +301,7 @@
             playBtn.style.background = 'rgba(100, 100, 100, 0.9)';
 
             if (service.customAction) {
-                await service.customAction(this, match, originalUrl);
+                await service.customAction(this, match, originalUrl, service);
                 return;
             }
 
@@ -411,4 +468,7 @@
         childList: true,
         subtree: true
     });
+
+    window.addEventListener('pagehide', revokeAllTwitterBlobs, { once: true });
+    window.addEventListener('beforeunload', revokeAllTwitterBlobs, { once: true });
 })();
