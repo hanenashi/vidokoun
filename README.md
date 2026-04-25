@@ -1,7 +1,7 @@
 # vidokoun
 
 **[Install vidokoun Userscript](https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js)**  
-*(Requires a userscript manager like [Tampermonkey](https://www.tampermonkey.net/). Tested mainly with Kiwi Browser on Android and desktop Chromium-style browsers.)*
+*(Requires a userscript manager. Tested mainly with Tampermonkey/Kiwi on Android and desktop Chromium-style browsers. v1.1.1 adds a compatibility wrapper for Firefox/Greasemonkey-style `GM.xmlHttpRequest`.)*
 
 ## TL;DR
 
@@ -13,20 +13,24 @@ Supported targets:
 - Vimeo
 - Twitter/X video tweets
 - Instagram posts/reels
+- Facebook videos/reels/posts where a video URL can be extracted
 - Direct `.mp4` links
 
 The script does **not** load heavy embeds immediately. It inserts clickable placeholders first, then loads the player only after user interaction.
 
 ## Current version
 
-`1.0.9`
+`1.1.1`
 
 Main focus of this version:
 
-- safer mobile behavior on video-heavy Okoun pages
+- Firefox/Greasemonkey compatibility wrapper for `GM.xmlHttpRequest`
+- keeps Tampermonkey/Kiwi/Chromium support through `GM_xmlhttpRequest`
+- experimental Instagram MP4 extraction from page HTML
+- experimental Facebook MP4 extraction from page HTML
 - Twitter/X MP4 extraction via `api.vxtwitter.com`
-- `GM_xmlhttpRequest` blob-loading workaround for Twitter/X CDN/CORS/hotlink issues
-- automatic cleanup of old loaded Twitter/X blobs after 3 loaded videos
+- blob-loading workaround for CDN/CORS/hotlink issues
+- automatic cleanup of old loaded social blobs after 3 loaded videos
 
 ## Installation
 
@@ -43,16 +47,94 @@ The userscript includes update metadata:
 // @downloadURL  https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js
 ```
 
-Because the script uses `GM_xmlhttpRequest`, your userscript manager may request network permissions for:
+Because the script uses cross-origin userscript requests, your userscript manager may request network permissions for several domains.
+
+Current metadata grants:
+
+```javascript
+// @grant        GM_xmlhttpRequest
+// @grant        GM.xmlHttpRequest
+```
+
+Current network permissions:
 
 ```javascript
 // @connect      api.vxtwitter.com
 // @connect      video.twimg.com
 // @connect      twitter.com
 // @connect      x.com
+// @connect      facebook.com
+// @connect      www.facebook.com
+// @connect      instagram.com
+// @connect      www.instagram.com
+// @connect      cdninstagram.com
+// @connect      *.cdninstagram.com
+// @connect      fbcdn.net
+// @connect      *.fbcdn.net
+// @connect      *.xx.fbcdn.net
+// @connect      fbsbx.com
+// @connect      *.fbsbx.com
 ```
 
-If Twitter/X loading suddenly stops after an update, check that Tampermonkey/Kiwi actually accepted the new permissions. Userscript managers sometimes keep old permissions until the script is reinstalled. Very modern, very haunted.
+If video loading suddenly stops after an update, check that the userscript manager actually accepted the new permissions. Userscript managers sometimes keep old permissions until the script is reinstalled. Very modern, very haunted.
+
+## Browser / userscript manager notes
+
+### Tampermonkey / Kiwi / Chromium
+
+This is still the main target environment.
+
+Vidokoun uses:
+
+```javascript
+GM_xmlhttpRequest(...)
+```
+
+when available.
+
+### Firefox / Greasemonkey
+
+v1.1.1 adds a compatibility wrapper for newer Greasemonkey-style API:
+
+```javascript
+GM.xmlHttpRequest(...)
+```
+
+The wrapper tries APIs in this order:
+
+```text
+1. GM_xmlhttpRequest      // Tampermonkey / Violentmonkey-style
+2. GM.xmlHttpRequest      // Greasemonkey 4+ style
+3. throw clean error
+```
+
+Compatibility wrapper:
+
+```javascript
+function gmRequest(details) {
+    if (typeof GM_xmlhttpRequest === 'function') {
+        return GM_xmlhttpRequest(details);
+    }
+
+    if (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function') {
+        const result = GM.xmlHttpRequest(details);
+
+        if (result && typeof result.then === 'function') {
+            result.then((res) => {
+                if (typeof details.onload === 'function') details.onload(res);
+            }).catch((err) => {
+                if (typeof details.onerror === 'function') details.onerror(err);
+            });
+        }
+
+        return result;
+    }
+
+    throw new Error('No GM xmlhttp request API available');
+}
+```
+
+Reality check: Firefox/Greasemonkey API support is now handled, but Meta video extraction can still fail because Facebook/Instagram page HTML and media URLs are intentionally unfriendly. API compatibility does not magically make Meta less cursed.
 
 ## Technical overview
 
@@ -93,17 +175,19 @@ Video services are defined in a simple internal registry. Each service has:
 - `style`
 - optional `isNative`
 
-Standard iframe services use `getEmbedUrl()`. Direct MP4 links use native `<video>`. Twitter/X uses a custom loader.
+Standard iframe services use `getEmbedUrl()`. Direct MP4 links use native `<video>`. Twitter/X, Instagram, and Facebook use custom loaders.
 
 ### Lazy loading
 
-Vidokoun does not immediately load YouTube/Vimeo/Instagram/Twitter embeds.
+Vidokoun does not immediately load YouTube/Vimeo/Instagram/Facebook/Twitter embeds.
 
 Instead it inserts a placeholder:
 
 ```text
 [ Load YouTube ]
 [ Load Twitter/X ]
+[ Load Instagram ]
+[ Load Facebook ]
 ...
 ```
 
@@ -125,19 +209,32 @@ Important details:
 
 This avoids the earlier failure mode where injected embeds triggered new scans, which then triggered more DOM work, which made mobile browsers sad.
 
+## Social blob loading flow
+
+Blob playback is used for Twitter/X, Instagram, and Facebook when a direct MP4 URL can be found.
+
+General flow:
+
+```text
+User clicks placeholder
+  -> userscript request fetches service metadata/page HTML
+  -> script extracts first MP4 URL
+  -> userscript request downloads MP4 as Blob
+  -> URL.createObjectURL(blob) creates local blob: URL
+  -> <video src="blob:..."> is inserted
+  -> if anything fails, fallback iframe is inserted
+```
+
 ### Twitter/X loading flow
 
-Twitter/X handling is special because direct `video.twimg.com` playback can fail in browsers with `403 Forbidden`, CORS, hotlink protection, or other CDN weirdness.
-
-Current flow:
+Twitter/X uses `api.vxtwitter.com`:
 
 ```text
 User clicks Load Twitter/X
-  -> GM_xmlhttpRequest fetches JSON from api.vxtwitter.com
+  -> gmRequest fetches JSON from api.vxtwitter.com
   -> script extracts first MP4 URL
-  -> GM_xmlhttpRequest downloads MP4 as Blob
-  -> URL.createObjectURL(blob) creates local blob: URL
-  -> <video src="blob:..."> is inserted
+  -> gmRequest downloads MP4 as Blob
+  -> blob video is inserted
   -> if anything fails, fallback to Twitter embed iframe
 ```
 
@@ -147,25 +244,69 @@ Fallback iframe:
 https://platform.twitter.com/embed/Tweet.html?id=<tweet_id>
 ```
 
-### Twitter/X memory cleanup
+### Instagram loading flow
+
+Instagram handling is experimental.
+
+```text
+User clicks Load Instagram
+  -> gmRequest fetches Instagram post/reel HTML
+  -> script searches meta tags and embedded JSON for an MP4 URL
+  -> gmRequest downloads MP4 as Blob
+  -> blob video is inserted
+  -> if anything fails, fallback to Instagram embed iframe
+```
+
+Fallback iframe:
+
+```text
+https://www.instagram.com/<p|reel>/<shortcode>/embed/
+```
+
+### Facebook loading flow
+
+Facebook handling is experimental and probably the most fragile.
+
+```text
+User clicks Load Facebook
+  -> gmRequest fetches Facebook page HTML
+  -> script searches meta tags and embedded JSON for an MP4 URL
+  -> gmRequest downloads MP4 as Blob
+  -> blob video is inserted
+  -> if anything fails, fallback to Facebook plugin iframe
+```
+
+Fallback iframe:
+
+```text
+https://www.facebook.com/plugins/video.php?href=<encoded_original_url>&show_text=false&width=550
+```
+
+## Social blob memory cleanup
 
 Blob playback is useful, but it has a cost: the whole MP4 is downloaded into memory/blob storage first.
 
-To avoid memory buildup, v1.0.9 keeps only the latest 3 loaded Twitter/X blob videos alive:
+To avoid memory buildup, v1.1.1 keeps only the latest 3 loaded social blob videos alive:
 
 ```javascript
-const MAX_LOADED_TWITTER_BLOBS = 3;
+const MAX_LOADED_SOCIAL_BLOBS = 3;
 ```
 
-When a 4th Twitter/X blob video is loaded:
+Tracked blob videos include:
+
+- Twitter/X blob videos
+- Instagram blob videos
+- Facebook blob videos
+
+When a 4th social blob video is loaded:
 
 ```text
-oldest loaded Twitter/X video
+oldest loaded social blob video
   -> pause()
   -> remove src
   -> video.load()
   -> URL.revokeObjectURL(blobUrl)
-  -> replace video with a fresh Load Twitter/X placeholder
+  -> replace video with a fresh Load placeholder
 ```
 
 This cleanup is silent. No warning, no popup, no tiny bureaucrat with a clipboard.
@@ -173,11 +314,11 @@ This cleanup is silent. No warning, no popup, no tiny bureaucrat with a clipboar
 Additional cleanup runs on page exit:
 
 ```javascript
-window.addEventListener('pagehide', revokeAllTwitterBlobs, { once: true });
-window.addEventListener('beforeunload', revokeAllTwitterBlobs, { once: true });
+window.addEventListener('pagehide', revokeAllSocialBlobs, { once: true });
+window.addEventListener('beforeunload', revokeAllSocialBlobs, { once: true });
 ```
 
-### Direct MP4 handling
+## Direct MP4 handling
 
 Direct `.mp4` links are inserted as native videos:
 
@@ -185,41 +326,43 @@ Direct `.mp4` links are inserted as native videos:
 <video controls preload="none" playsinline>
 ```
 
-They do not use the Twitter/X blob cleanup queue, because they are not downloaded through `GM_xmlhttpRequest` first.
+They do not use the social blob cleanup queue, because they are not downloaded through `gmRequest` first.
 
-### Fallback behavior
+## Fallback behavior
 
-If Twitter/X MP4 extraction or blob loading fails, Vidokoun falls back to a full Twitter/X embed iframe.
+If MP4 extraction or blob loading fails, Vidokoun falls back to the service iframe/embed where available.
 
-This is heavier, but better than a dead black rectangle.
-
-## Permissions
-
-Current metadata grants:
-
-```javascript
-// @grant        GM_xmlhttpRequest
-// @connect      api.vxtwitter.com
-// @connect      video.twimg.com
-// @connect      twitter.com
-// @connect      x.com
-```
-
-The script previously used `@grant none`, but Twitter/X blob loading requires `GM_xmlhttpRequest`.
+Fallbacks are heavier, but better than a dead black rectangle.
 
 ## Notes for mobile / Kiwi Browser
 
-Pixel/Kiwi was one of the main pain points behind v1.0.8 and v1.0.9.
+Pixel/Kiwi was one of the main pain points behind v1.0.8 and newer.
 
 Known practical behavior:
 
 - listing pages should stay light because videos are lazy-loaded
-- Twitter/X videos are loaded as blobs, so they cost real memory
-- only 3 Twitter/X blob videos are kept loaded at once
-- older loaded Twitter/X videos are automatically replaced back with placeholders
-- YouTube/Vimeo/Instagram iframes are still browser-managed and can be heavier than placeholders after loading
+- blob-loaded videos cost real memory
+- only 3 social blob videos are kept loaded at once
+- older loaded blob videos are automatically replaced back with placeholders
+- YouTube/Vimeo/Instagram/Facebook iframes are still browser-managed and can be heavier than placeholders after loading
+- Meta extraction may fail frequently; fallback iframe is expected, not a disaster
 
 ## Changelog highlights
+
+### 1.1.1
+
+- Added Firefox/Greasemonkey compatibility wrapper.
+- Added `GM.xmlHttpRequest` grant while keeping `GM_xmlhttpRequest`.
+- Routed internal cross-origin requests through `gmRequest(...)`.
+- Keeps Chromium/Kiwi/Tampermonkey behavior intact.
+
+### 1.1.0
+
+- Added experimental Instagram MP4 extraction from page HTML.
+- Added experimental Facebook MP4 extraction from page HTML.
+- Added fallback iframes for Instagram and Facebook.
+- Generalized blob cleanup from Twitter-only to social blob videos.
+- Added Meta-related `@connect` permissions.
 
 ### 1.0.9
 
@@ -227,7 +370,7 @@ Known practical behavior:
 - Keeps only 3 loaded Twitter/X blob videos alive.
 - Revokes blob URLs with `URL.revokeObjectURL()`.
 - Replaces unloaded old videos back with fresh placeholders.
-- Cleans all tracked Twitter/X blobs on `pagehide` / `beforeunload`.
+- Cleans tracked Twitter/X blobs on `pagehide` / `beforeunload`.
 
 ### 1.0.8
 
@@ -246,7 +389,8 @@ Known practical behavior:
 ## Limitations
 
 - Twitter/X behavior depends on `api.vxtwitter.com` and Twitter/X media availability.
+- Instagram/Facebook extraction is best-effort only and can break when Meta changes page structure.
 - Blob loading downloads the whole MP4 before playback; this is not true streaming.
-- Very large Twitter/X videos can still be memory-expensive before cleanup has a chance to help.
-- Instagram embeds may be heavy or blocked depending on browser/session/privacy settings.
+- Very large videos can still be memory-expensive before cleanup has a chance to help.
+- Some Facebook/Instagram videos may require login, regional access, cookies, or may hide media URLs from page HTML.
 - A real streaming proxy would need an external server; userscript-only code cannot truly proxy server-side traffic.
