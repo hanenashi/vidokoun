@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         vidokoun
 // @namespace    http://tampermonkey.net/
-// @version      1.0.9
-// @description  Lazy-loads videos, extracts Twitter/X MP4s, tries GM blob loading, auto-cleans old blobs, and falls back to Twitter iframe
+// @version      1.1.0
+// @description  Lazy-loads videos, tries GM blob loading for Twitter/X, Instagram, and Facebook, auto-cleans old blobs, and falls back to embeds
 // @author       hanenashi
 // @match        *://*.okoun.cz/*
 // @updateURL    https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js
@@ -12,6 +12,17 @@
 // @connect      video.twimg.com
 // @connect      twitter.com
 // @connect      x.com
+// @connect      facebook.com
+// @connect      www.facebook.com
+// @connect      instagram.com
+// @connect      www.instagram.com
+// @connect      cdninstagram.com
+// @connect      *.cdninstagram.com
+// @connect      fbcdn.net
+// @connect      *.fbcdn.net
+// @connect      *.xx.fbcdn.net
+// @connect      fbsbx.com
+// @connect      *.fbsbx.com
 // ==/UserScript==
 
 (function() {
@@ -19,9 +30,9 @@
 
     const DEBUG = false;
     const MAX_WIDTH = '550px';
-    const MAX_LOADED_TWITTER_BLOBS = 3;
+    const MAX_LOADED_SOCIAL_BLOBS = 3;
 
-    const loadedTwitterBlobs = [];
+    const loadedSocialBlobs = [];
 
     function log(...args) {
         if (DEBUG) console.log('[vidokoun]', ...args);
@@ -54,7 +65,30 @@
         });
     }
 
-    function gmGetBlobUrl(url, timeout = 30000) {
+    function gmGetText(url, referer, timeout = 15000) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                timeout,
+                headers: {
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Referer': referer || url
+                },
+                onload: (res) => {
+                    if (res.status < 200 || res.status >= 300) {
+                        reject(new Error(`HTML HTTP ${res.status}`));
+                        return;
+                    }
+                    resolve(res.responseText || '');
+                },
+                onerror: () => reject(new Error('GM HTML request failed')),
+                ontimeout: () => reject(new Error('GM HTML request timeout'))
+            });
+        });
+    }
+
+    function gmGetBlobUrl(url, referer, timeout = 30000) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'GET',
@@ -63,7 +97,7 @@
                 responseType: 'blob',
                 headers: {
                     'Accept': 'video/mp4,video/*,*/*',
-                    'Referer': 'https://x.com/'
+                    'Referer': referer || url
                 },
                 onload: (res) => {
                     if (res.status < 200 || res.status >= 300) {
@@ -84,6 +118,71 @@
         });
     }
 
+    function htmlDecode(str) {
+        const textarea = document.createElement('textarea');
+        textarea.innerHTML = String(str || '');
+        return textarea.value;
+    }
+
+    function looseDecodeUrl(str) {
+        if (!str) return '';
+
+        let out = String(str);
+
+        for (let i = 0; i < 3; i++) {
+            out = htmlDecode(out)
+                .replace(/\\\//g, '/')
+                .replace(/\\u0025/g, '%')
+                .replace(/\\u0026/g, '&')
+                .replace(/\\u003d/gi, '=')
+                .replace(/\\u003f/gi, '?')
+                .replace(/\\u002f/gi, '/')
+                .replace(/\\u003a/gi, ':');
+
+            try {
+                out = decodeURIComponent(out);
+            } catch (e) {
+                // Keep partially decoded value.
+            }
+        }
+
+        return out;
+    }
+
+    function looksLikeMp4Url(url) {
+        return /^https?:\/\//i.test(url || '') && /\.mp4(?:[?#]|$)/i.test(url || '');
+    }
+
+    function extractFirstMp4FromHtml(html) {
+        if (!html) return null;
+
+        const patterns = [
+            /<meta[^>]+(?:property|name)=["']og:video(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i,
+            /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:video(?::secure_url)?["']/i,
+            /<meta[^>]+(?:property|name)=["']twitter:player:stream["'][^>]+content=["']([^"']+)["']/i,
+            /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']twitter:player:stream["']/i,
+            /"playable_url_quality_hd"\s*:\s*"([^"]+)"/i,
+            /"playable_url"\s*:\s*"([^"]+)"/i,
+            /"browser_native_hd_url"\s*:\s*"([^"]+)"/i,
+            /"browser_native_sd_url"\s*:\s*"([^"]+)"/i,
+            /"video_url"\s*:\s*"([^"]+)"/i,
+            /"contentUrl"\s*:\s*"([^"]+)"/i,
+            /"src"\s*:\s*"(https?:\\\/\\\/[^"<>]+?\.mp4[^"<>]*)"/i,
+            /(https?:\\\/\\\/[^"<>]+?\.mp4[^"<>]*)/i,
+            /(https?:\/\/[^"'<>\s]+?\.mp4[^"'<>\s]*)/i
+        ];
+
+        for (const pattern of patterns) {
+            const match = html.match(pattern);
+            if (!match || !match[1]) continue;
+
+            const decoded = looseDecodeUrl(match[1]);
+            if (looksLikeMp4Url(decoded)) return decoded;
+        }
+
+        return null;
+    }
+
     function makeTwitterIframe(id) {
         const iframe = document.createElement('iframe');
         iframe.setAttribute('data-vidokoun-node', '1');
@@ -101,32 +200,112 @@
         return iframe;
     }
 
-    function registerTwitterBlobVideo(record) {
-        loadedTwitterBlobs.push(record);
-        cleanupTwitterBlobs();
+    function makeInstagramIframe(shortcode, type) {
+        const iframe = document.createElement('iframe');
+        iframe.setAttribute('data-vidokoun-node', '1');
+        iframe.src = `https://www.instagram.com/${type}/${encodeURIComponent(shortcode)}/embed/`;
+        iframe.style.cssText = [
+            'width: 100%;',
+            'height: 560px;',
+            'resize: vertical;',
+            'border: none;',
+            'border-radius: 4px;',
+            'background: #fff;'
+        ].join(' ');
+        iframe.allowFullscreen = true;
+        iframe.allow = 'autoplay; fullscreen; picture-in-picture';
+        return iframe;
     }
 
-    function unregisterTwitterBlobVideo(record) {
-        const index = loadedTwitterBlobs.indexOf(record);
-        if (index !== -1) loadedTwitterBlobs.splice(index, 1);
+    function makeFacebookIframe(originalUrl) {
+        const iframe = document.createElement('iframe');
+        iframe.setAttribute('data-vidokoun-node', '1');
+        iframe.src = `https://www.facebook.com/plugins/video.php?href=${encodeURIComponent(originalUrl)}&show_text=false&width=550`;
+        iframe.style.cssText = [
+            'width: 100%;',
+            'height: 460px;',
+            'resize: vertical;',
+            'border: none;',
+            'border-radius: 4px;',
+            'background: #fff;'
+        ].join(' ');
+        iframe.allowFullscreen = true;
+        iframe.allow = 'autoplay; encrypted-media; fullscreen; picture-in-picture';
+        return iframe;
     }
 
-    function cleanupTwitterBlobs() {
-        while (loadedTwitterBlobs.length > MAX_LOADED_TWITTER_BLOBS) {
-            const oldest = loadedTwitterBlobs.shift();
-            if (oldest && typeof oldest.unload === 'function') {
-                oldest.unload();
-            }
+    function registerSocialBlobVideo(record) {
+        loadedSocialBlobs.push(record);
+        cleanupSocialBlobs();
+    }
+
+    function unregisterSocialBlobVideo(record) {
+        const index = loadedSocialBlobs.indexOf(record);
+        if (index !== -1) loadedSocialBlobs.splice(index, 1);
+    }
+
+    function cleanupSocialBlobs() {
+        while (loadedSocialBlobs.length > MAX_LOADED_SOCIAL_BLOBS) {
+            const oldest = loadedSocialBlobs.shift();
+            if (oldest && typeof oldest.unload === 'function') oldest.unload();
         }
     }
 
-    function revokeAllTwitterBlobs() {
-        while (loadedTwitterBlobs.length) {
-            const item = loadedTwitterBlobs.shift();
-            if (item && typeof item.unload === 'function') {
-                item.unload(true);
-            }
+    function revokeAllSocialBlobs() {
+        while (loadedSocialBlobs.length) {
+            const item = loadedSocialBlobs.shift();
+            if (item && typeof item.unload === 'function') item.unload(true);
         }
+    }
+
+    async function insertBlobVideo({ placeholderNode, match, originalUrl, service, videoUrl, referer, fallbackNodeFactory }) {
+        const blobUrl = await gmGetBlobUrl(videoUrl, referer);
+
+        const video = document.createElement('video');
+        video.src = blobUrl;
+        video.controls = true;
+        video.autoplay = true;
+        video.preload = 'metadata';
+        video.playsInline = true;
+        video.setAttribute('data-vidokoun-node', '1');
+        video.style.cssText = [
+            'width: 100%;',
+            service.style || 'aspect-ratio: 16/9;',
+            'border-radius: 4px;',
+            'box-shadow: 0 2px 8px rgba(0,0,0,0.2);',
+            'background: #000;'
+        ].join(' ');
+
+        let unloaded = false;
+        const record = {
+            blobUrl,
+            video,
+            unload: (pageLeaving = false) => {
+                if (unloaded) return;
+                unloaded = true;
+
+                try { video.pause(); } catch (e) { /* ignore */ }
+                video.removeAttribute('src');
+                try { video.load(); } catch (e) { /* ignore */ }
+                URL.revokeObjectURL(blobUrl);
+                unregisterSocialBlobVideo(record);
+
+                if (!pageLeaving && video.isConnected) {
+                    const freshPlaceholder = createPlaceholder(service, match, originalUrl);
+                    video.replaceWith(freshPlaceholder);
+                }
+            }
+        };
+
+        video.addEventListener('error', () => {
+            record.unload(true);
+            if (video.isConnected && fallbackNodeFactory) {
+                video.replaceWith(fallbackNodeFactory());
+            }
+        }, { once: true });
+
+        placeholderNode.replaceWith(video);
+        registerSocialBlobVideo(record);
     }
 
     const services = [
@@ -152,72 +331,21 @@
 
                 try {
                     const data = await gmGetJson(`https://api.vxtwitter.com/${encodeURIComponent(username)}/status/${encodeURIComponent(id)}`);
-
                     const videoUrl =
                         (data.mediaURLs || []).find(url => /\.mp4(?:\?|$)/i.test(url)) ||
                         (data.media_extended || []).map(m => m.url).find(url => /\.mp4(?:\?|$)/i.test(url));
 
-                    if (!videoUrl) {
-                        throw new Error('No MP4 found in tweet');
-                    }
+                    if (!videoUrl) throw new Error('No MP4 found in tweet');
 
-                    const blobUrl = await gmGetBlobUrl(videoUrl);
-
-                    const video = document.createElement('video');
-                    video.src = blobUrl;
-                    video.controls = true;
-                    video.autoplay = true;
-                    video.preload = 'metadata';
-                    video.playsInline = true;
-                    video.setAttribute('data-vidokoun-node', '1');
-                    video.style.cssText = [
-                        'width: 100%;',
-                        'aspect-ratio: 16/9;',
-                        'border-radius: 4px;',
-                        'box-shadow: 0 2px 8px rgba(0,0,0,0.2);',
-                        'background: #000;'
-                    ].join(' ');
-
-                    let unloaded = false;
-                    const record = {
-                        blobUrl,
-                        video,
-                        unload: (pageLeaving = false) => {
-                            if (unloaded) return;
-                            unloaded = true;
-
-                            try {
-                                video.pause();
-                            } catch (e) {
-                                // ignore
-                            }
-
-                            video.removeAttribute('src');
-                            try {
-                                video.load();
-                            } catch (e) {
-                                // ignore
-                            }
-
-                            URL.revokeObjectURL(blobUrl);
-                            unregisterTwitterBlobVideo(record);
-
-                            if (!pageLeaving && video.isConnected) {
-                                const freshPlaceholder = createPlaceholder(service, match, originalUrl);
-                                video.replaceWith(freshPlaceholder);
-                            }
-                        }
-                    };
-
-                    video.addEventListener('error', () => {
-                        record.unload(true);
-                        if (video.isConnected) {
-                            video.replaceWith(makeTwitterIframe(id));
-                        }
-                    }, { once: true });
-
-                    placeholderNode.replaceWith(video);
-                    registerTwitterBlobVideo(record);
+                    await insertBlobVideo({
+                        placeholderNode,
+                        match,
+                        originalUrl,
+                        service,
+                        videoUrl,
+                        referer: 'https://x.com/',
+                        fallbackNodeFactory: () => makeTwitterIframe(id)
+                    });
                 } catch (e) {
                     log('Twitter/X GM blob load failed, falling back to iframe:', e);
                     placeholderNode.replaceWith(makeTwitterIframe(id));
@@ -226,9 +354,58 @@
         },
         {
             name: 'Instagram',
-            regex: /instagram\.com\/(?:p|reel)\/([a-zA-Z0-9_-]+)/i,
-            getEmbedUrl: (id) => `https://www.instagram.com/p/${id}/embed/`,
-            style: 'aspect-ratio: 4/5; min-height: 550px;'
+            regex: /instagram\.com\/(p|reel)\/([a-zA-Z0-9_-]+)/i,
+            style: 'aspect-ratio: 4/5; min-height: 550px; background: #000;',
+            customAction: async (placeholderNode, match, originalUrl, service) => {
+                const type = match[1];
+                const shortcode = match[2];
+
+                try {
+                    const html = await gmGetText(originalUrl, 'https://www.instagram.com/');
+                    const videoUrl = extractFirstMp4FromHtml(html);
+
+                    if (!videoUrl) throw new Error('No MP4 found in Instagram page');
+
+                    await insertBlobVideo({
+                        placeholderNode,
+                        match,
+                        originalUrl,
+                        service,
+                        videoUrl,
+                        referer: 'https://www.instagram.com/',
+                        fallbackNodeFactory: () => makeInstagramIframe(shortcode, type)
+                    });
+                } catch (e) {
+                    log('Instagram GM blob load failed, falling back to iframe:', e);
+                    placeholderNode.replaceWith(makeInstagramIframe(shortcode, type));
+                }
+            }
+        },
+        {
+            name: 'Facebook',
+            regex: /facebook\.com\/(?:watch\/?\?v=\d+|reel\/[^/?#]+|[^\s?#]+\/videos\/[^/?#]+|share\/v\/[^/?#]+|[^\s?#]+\/posts\/[^/?#]+)/i,
+            style: 'aspect-ratio: 16/9; background: #000;',
+            customAction: async (placeholderNode, match, originalUrl, service) => {
+                try {
+                    const html = await gmGetText(originalUrl, 'https://www.facebook.com/');
+                    const videoUrl = extractFirstMp4FromHtml(html);
+
+                    if (!videoUrl) throw new Error('No MP4 found in Facebook page');
+
+                    await insertBlobVideo({
+                        placeholderNode,
+                        match,
+                        originalUrl,
+                        service,
+                        videoUrl,
+                        referer: 'https://www.facebook.com/',
+                        fallbackNodeFactory: () => makeFacebookIframe(originalUrl)
+                    });
+                } catch (e) {
+                    log('Facebook GM blob load failed, falling back to iframe:', e);
+                    placeholderNode.replaceWith(makeFacebookIframe(originalUrl));
+                }
+            }
         },
         {
             name: 'Direct MP4',
@@ -244,7 +421,7 @@
     }
 
     function createPlaceholder(service, match, originalUrl) {
-        const id = service.name === 'Twitter/X' ? match[2] : match[1];
+        const id = service.name === 'Twitter/X' ? match[2] : (service.name === 'Instagram' ? match[2] : match[1]);
 
         const placeholder = document.createElement('div');
         placeholder.setAttribute('data-vidokoun-node', '1');
@@ -415,7 +592,6 @@
 
     function processRoot(root) {
         if (!root) return;
-
         if (root.nodeType !== 1) return;
         if (isInsideVidokounNode(root)) return;
 
@@ -449,7 +625,6 @@
             const roots = Array.from(pendingRoots);
             pendingRoots.clear();
             scanTimer = null;
-
             roots.forEach(processRoot);
         }, 250);
     }
@@ -469,6 +644,6 @@
         subtree: true
     });
 
-    window.addEventListener('pagehide', revokeAllTwitterBlobs, { once: true });
-    window.addEventListener('beforeunload', revokeAllTwitterBlobs, { once: true });
+    window.addEventListener('pagehide', revokeAllSocialBlobs, { once: true });
+    window.addEventListener('beforeunload', revokeAllSocialBlobs, { once: true });
 })();
