@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         vidokoun
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
+// @version      1.1.1
 // @description  Lazy-loads videos, tries GM blob loading for Twitter/X, Instagram, and Facebook, auto-cleans old blobs, and falls back to embeds
 // @author       hanenashi
 // @match        *://*.okoun.cz/*
 // @updateURL    https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js
 // @downloadURL  https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js
 // @grant        GM_xmlhttpRequest
+// @grant        GM.xmlHttpRequest
 // @connect      api.vxtwitter.com
 // @connect      video.twimg.com
 // @connect      twitter.com
@@ -38,9 +39,31 @@
         if (DEBUG) console.log('[vidokoun]', ...args);
     }
 
+    function gmRequest(details) {
+        if (typeof GM_xmlhttpRequest === 'function') {
+            return GM_xmlhttpRequest(details);
+        }
+
+        if (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function') {
+            const result = GM.xmlHttpRequest(details);
+
+            if (result && typeof result.then === 'function') {
+                result.then((res) => {
+                    if (typeof details.onload === 'function') details.onload(res);
+                }).catch((err) => {
+                    if (typeof details.onerror === 'function') details.onerror(err);
+                });
+            }
+
+            return result;
+        }
+
+        throw new Error('No GM xmlhttp request API available');
+    }
+
     function gmGetJson(url, timeout = 12000) {
         return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
+            gmRequest({
                 method: 'GET',
                 url,
                 timeout,
@@ -67,7 +90,7 @@
 
     function gmGetText(url, referer, timeout = 15000) {
         return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
+            gmRequest({
                 method: 'GET',
                 url,
                 timeout,
@@ -90,7 +113,7 @@
 
     function gmGetBlobUrl(url, referer, timeout = 30000) {
         return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
+            gmRequest({
                 method: 'GET',
                 url,
                 timeout,
