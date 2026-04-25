@@ -1,13 +1,17 @@
 // ==UserScript==
 // @name         vidokoun
 // @namespace    http://tampermonkey.net/
-// @version      1.0.7
-// @description  Lazy-loads videos, extracts Twitter/X MP4s, and adds fallback source links without melting mobile browsers
+// @version      1.0.8
+// @description  Lazy-loads videos, extracts Twitter/X MP4s, tries GM blob loading, and falls back to Twitter iframe
 // @author       hanenashi
 // @match        *://*.okoun.cz/*
 // @updateURL    https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js
 // @downloadURL  https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      api.vxtwitter.com
+// @connect      video.twimg.com
+// @connect      twitter.com
+// @connect      x.com
 // ==/UserScript==
 
 (function() {
@@ -18,6 +22,80 @@
 
     function log(...args) {
         if (DEBUG) console.log('[vidokoun]', ...args);
+    }
+
+    function gmGetJson(url, timeout = 12000) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                timeout,
+                headers: {
+                    'Accept': 'application/json,text/plain,*/*'
+                },
+                onload: (res) => {
+                    if (res.status < 200 || res.status >= 300) {
+                        reject(new Error(`HTTP ${res.status}`));
+                        return;
+                    }
+
+                    try {
+                        resolve(JSON.parse(res.responseText));
+                    } catch (e) {
+                        reject(new Error('Bad JSON response'));
+                    }
+                },
+                onerror: () => reject(new Error('GM JSON request failed')),
+                ontimeout: () => reject(new Error('GM JSON request timeout'))
+            });
+        });
+    }
+
+    function gmGetBlobUrl(url, timeout = 30000) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                timeout,
+                responseType: 'blob',
+                headers: {
+                    'Accept': 'video/mp4,video/*,*/*',
+                    'Referer': 'https://x.com/'
+                },
+                onload: (res) => {
+                    if (res.status < 200 || res.status >= 300) {
+                        reject(new Error(`MP4 HTTP ${res.status}`));
+                        return;
+                    }
+
+                    if (!res.response || !res.response.size) {
+                        reject(new Error('Empty MP4 blob'));
+                        return;
+                    }
+
+                    resolve(URL.createObjectURL(res.response));
+                },
+                onerror: () => reject(new Error('GM MP4 request failed')),
+                ontimeout: () => reject(new Error('GM MP4 request timeout'))
+            });
+        });
+    }
+
+    function makeTwitterIframe(id) {
+        const iframe = document.createElement('iframe');
+        iframe.setAttribute('data-vidokoun-node', '1');
+        iframe.src = `https://platform.twitter.com/embed/Tweet.html?id=${encodeURIComponent(id)}`;
+        iframe.style.cssText = [
+            'width: 100%;',
+            'height: 460px;',
+            'resize: vertical;',
+            'border: none;',
+            'border-radius: 4px;',
+            'background: #fff;'
+        ].join(' ');
+        iframe.allowFullscreen = true;
+        iframe.allow = 'autoplay; fullscreen; picture-in-picture';
+        return iframe;
     }
 
     const services = [
@@ -40,23 +118,9 @@
             customAction: async (placeholderNode, match, originalUrl) => {
                 const username = match[1];
                 const id = match[2];
-                const button = placeholderNode.querySelector('.vidokoun-play');
 
                 try {
-                    const controller = new AbortController();
-                    const timer = setTimeout(() => controller.abort(), 12000);
-
-                    const res = await fetch(`https://api.vxtwitter.com/${username}/status/${id}`, {
-                        signal: controller.signal
-                    });
-
-                    clearTimeout(timer);
-
-                    if (!res.ok) {
-                        throw new Error(`vxtwitter HTTP ${res.status}`);
-                    }
-
-                    const data = await res.json();
+                    const data = await gmGetJson(`https://api.vxtwitter.com/${encodeURIComponent(username)}/status/${encodeURIComponent(id)}`);
 
                     const videoUrl =
                         (data.mediaURLs || []).find(url => /\.mp4(?:\?|$)/i.test(url)) ||
@@ -66,8 +130,10 @@
                         throw new Error('No MP4 found in tweet');
                     }
 
+                    const blobUrl = await gmGetBlobUrl(videoUrl);
+
                     const video = document.createElement('video');
-                    video.src = videoUrl;
+                    video.src = blobUrl;
                     video.controls = true;
                     video.autoplay = true;
                     video.preload = 'metadata';
@@ -81,38 +147,15 @@
                         'background: #000;'
                     ].join(' ');
 
+                    video.addEventListener('error', () => {
+                        URL.revokeObjectURL(blobUrl);
+                        video.replaceWith(makeTwitterIframe(id));
+                    }, { once: true });
+
                     placeholderNode.replaceWith(video);
                 } catch (e) {
-                    log('Twitter/X load failed:', e);
-
-                    const failBox = document.createElement('div');
-                    failBox.setAttribute('data-vidokoun-node', '1');
-                    failBox.style.cssText = [
-                        'width: 100%;',
-                        'min-height: 90px;',
-                        'background: #1a1a1a;',
-                        'color: #ddd;',
-                        'border-radius: 4px;',
-                        'display: flex;',
-                        'align-items: center;',
-                        'justify-content: center;',
-                        'font-family: sans-serif;',
-                        'font-size: 13px;',
-                        'text-align: center;',
-                        'padding: 12px;',
-                        'box-sizing: border-box;'
-                    ].join(' ');
-
-                    failBox.innerHTML = `
-                        <div>
-                            <div style="margin-bottom: 8px;">Could not extract Twitter/X video.</div>
-                            <a href="${escapeAttr(originalUrl)}" target="_blank" rel="noopener noreferrer" style="color:#aaa;">
-                                Open original link
-                            </a>
-                        </div>
-                    `;
-
-                    placeholderNode.replaceWith(failBox);
+                    log('Twitter/X GM blob load failed, falling back to iframe:', e);
+                    placeholderNode.replaceWith(makeTwitterIframe(id));
                 }
             }
         },
