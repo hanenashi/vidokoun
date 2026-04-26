@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         vidokoun
 // @namespace    http://tampermonkey.net/
-// @version      1.1.3
+// @version      1.1.4
 // @description  Lazy-loads videos, tries cancelable GM blob loading for Twitter/X, Instagram, and Facebook, auto-cleans old blobs, and falls back to embeds
 // @author       hanenashi
 // @match        *://*.okoun.cz/*
@@ -30,15 +30,53 @@
     'use strict';
 
     const DEBUG = false;
+    const APP_VERSION = '1.1.4';
+    const GITHUB_URL = 'https://github.com/hanenashi/vidokoun';
+    const SETTINGS_KEY = 'vidokoun.settings.v1';
     const MAX_WIDTH = '550px';
-    const MAX_LOADED_SOCIAL_BLOBS = 3;
-    const MAX_BLOB_BYTES = 80 * 1024 * 1024;
     const BLOB_DOWNLOAD_TIMEOUT = 30000;
 
+    const DEFAULT_SETTINGS = {
+        maxBlobMb: 80,
+        maxLoadedBlobs: 3
+    };
+
+    let settings = loadSettings();
     const loadedSocialBlobs = [];
 
     function log(...args) {
         if (DEBUG) console.log('[vidokoun]', ...args);
+    }
+
+    function loadSettings() {
+        try {
+            const raw = localStorage.getItem(SETTINGS_KEY);
+            if (!raw) return { ...DEFAULT_SETTINGS };
+            const parsed = JSON.parse(raw);
+            return {
+                maxBlobMb: sanitizeChoice(parsed.maxBlobMb, [25, 50, 80, 120, 200], DEFAULT_SETTINGS.maxBlobMb),
+                maxLoadedBlobs: sanitizeChoice(parsed.maxLoadedBlobs, [1, 2, 3, 5], DEFAULT_SETTINGS.maxLoadedBlobs)
+            };
+        } catch (e) {
+            return { ...DEFAULT_SETTINGS };
+        }
+    }
+
+    function saveSettings() {
+        try {
+            localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+        } catch (e) {
+            // ignore
+        }
+    }
+
+    function sanitizeChoice(value, allowed, fallback) {
+        const n = Number(value);
+        return allowed.includes(n) ? n : fallback;
+    }
+
+    function maxBlobBytes() {
+        return settings.maxBlobMb * 1024 * 1024;
     }
 
     function formatBytes(bytes) {
@@ -142,8 +180,9 @@
                         if (aborted || settled) return;
                         const loaded = ev && Number.isFinite(ev.loaded) ? ev.loaded : 0;
                         const total = ev && ev.lengthComputable && Number.isFinite(ev.total) ? ev.total : 0;
+                        const limit = maxBlobBytes();
 
-                        if (total > MAX_BLOB_BYTES || loaded > MAX_BLOB_BYTES) {
+                        if (total > limit || loaded > limit) {
                             aborted = true;
                             if (req && typeof req.abort === 'function') req.abort();
                             fail(new Error(`Video too large for safe blob load (${formatBytes(Math.max(total, loaded))})`));
@@ -156,13 +195,14 @@
                         if (aborted || settled) return;
                         if (res.status < 200 || res.status >= 300) return fail(new Error(`MP4 HTTP ${res.status}`));
 
+                        const limit = maxBlobBytes();
                         const contentLength = Number(getResponseHeader(res.responseHeaders, 'content-length'));
-                        if (Number.isFinite(contentLength) && contentLength > MAX_BLOB_BYTES) {
+                        if (Number.isFinite(contentLength) && contentLength > limit) {
                             return fail(new Error(`Video too large for safe blob load (${formatBytes(contentLength)})`));
                         }
 
                         if (!res.response || !res.response.size) return fail(new Error('Empty MP4 blob'));
-                        if (res.response.size > MAX_BLOB_BYTES) {
+                        if (res.response.size > limit) {
                             return fail(new Error(`Video too large for safe blob load (${formatBytes(res.response.size)})`));
                         }
 
@@ -275,20 +315,11 @@
         const panel = document.createElement('div');
         panel.setAttribute('data-vidokoun-node', '1');
         panel.style.cssText = [
-            'width: 100%;',
-            service.style || 'aspect-ratio: 16/9;',
-            'background: #1a1a1a;',
-            'color: #ddd;',
-            'border-radius: 4px;',
-            'display: flex;',
-            'align-items: center;',
-            'justify-content: center;',
-            'font-family: sans-serif;',
-            'font-size: 13px;',
-            'text-align: center;',
-            'padding: 12px;',
-            'box-sizing: border-box;',
-            'box-shadow: 0 2px 8px rgba(0,0,0,0.2);'
+            'width: 100%;', service.style || 'aspect-ratio: 16/9;',
+            'background: #1a1a1a;', 'color: #ddd;', 'border-radius: 4px;',
+            'display: flex;', 'align-items: center;', 'justify-content: center;',
+            'font-family: sans-serif;', 'font-size: 13px;', 'text-align: center;',
+            'padding: 12px;', 'box-sizing: border-box;', 'box-shadow: 0 2px 8px rgba(0,0,0,0.2);'
         ].join(' ');
 
         const box = document.createElement('div');
@@ -299,7 +330,7 @@
 
         const hint = document.createElement('div');
         hint.style.cssText = 'font-size: 11px; color: #aaa;';
-        hint.textContent = `Safe limit: ${formatBytes(MAX_BLOB_BYTES)}`;
+        hint.textContent = `Safe limit: ${formatBytes(maxBlobBytes())}`;
 
         const row = document.createElement('div');
         row.style.cssText = 'display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;';
@@ -332,6 +363,143 @@
         };
     }
 
+    function closeSettingsMenus() {
+        document.querySelectorAll('.vidokoun-settings-menu').forEach(menu => menu.remove());
+    }
+
+    function makeSettingsButton() {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = 'settings';
+        btn.title = 'vidokoun settings';
+        btn.setAttribute('data-vidokoun-node', '1');
+        btn.style.cssText = [
+            'position: absolute;', 'top: 6px;', 'right: 6px;', 'z-index: 5;',
+            'font-family: sans-serif;', 'font-size: 10px;', 'line-height: 1;',
+            'padding: 4px 6px;', 'border-radius: 999px;', 'border: 1px solid rgba(255,255,255,0.25);',
+            'background: rgba(0,0,0,0.62);', 'color: #ddd;', 'cursor: pointer;',
+            'opacity: 0.72;'
+        ].join(' ');
+
+        btn.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const host = btn.closest('[data-vidokoun-node="1"]');
+            if (!host) return;
+
+            const existing = host.querySelector('.vidokoun-settings-menu');
+            closeSettingsMenus();
+            if (existing) return;
+
+            const menu = makeSettingsMenu();
+            host.appendChild(menu);
+        });
+
+        return btn;
+    }
+
+    function makeSettingsMenu() {
+        const menu = document.createElement('div');
+        menu.className = 'vidokoun-settings-menu';
+        menu.setAttribute('data-vidokoun-node', '1');
+        menu.style.cssText = [
+            'position: absolute;', 'top: 34px;', 'right: 6px;', 'z-index: 20;',
+            'width: 230px;', 'max-width: calc(100% - 12px);',
+            'background: rgba(18,18,18,0.96);', 'color: #eee;',
+            'border: 1px solid rgba(255,255,255,0.22);', 'border-radius: 8px;',
+            'box-shadow: 0 4px 18px rgba(0,0,0,0.45);',
+            'font-family: sans-serif;', 'font-size: 12px;', 'text-align: left;',
+            'padding: 10px;', 'box-sizing: border-box;', 'cursor: default;'
+        ].join(' ');
+
+        menu.addEventListener('click', (ev) => ev.stopPropagation());
+
+        const title = document.createElement('div');
+        title.textContent = `vidokoun ${APP_VERSION}`;
+        title.style.cssText = 'font-weight: bold; margin-bottom: 8px;';
+        menu.appendChild(title);
+
+        menu.appendChild(makeSelectRow('Blob size limit', 'maxBlobMb', [25, 50, 80, 120, 200], 'MB', () => {}));
+        menu.appendChild(makeSelectRow('Loaded blob videos', 'maxLoadedBlobs', [1, 2, 3, 5], '', cleanupSocialBlobs));
+
+        const links = document.createElement('div');
+        links.style.cssText = 'display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px;';
+
+        const github = document.createElement('a');
+        github.href = GITHUB_URL;
+        github.target = '_blank';
+        github.rel = 'noopener noreferrer';
+        github.textContent = 'GitHub';
+        github.style.cssText = 'color: #aaa;';
+
+        const reset = document.createElement('button');
+        reset.type = 'button';
+        reset.textContent = 'Reset';
+        reset.style.cssText = 'font-size: 11px; padding: 3px 7px; border-radius: 4px; border: 1px solid #666; background: #2b2b2b; color: #ddd; cursor: pointer;';
+        reset.onclick = (ev) => {
+            ev.stopPropagation();
+            settings = { ...DEFAULT_SETTINGS };
+            saveSettings();
+            cleanupSocialBlobs();
+            closeSettingsMenus();
+        };
+
+        const close = document.createElement('button');
+        close.type = 'button';
+        close.textContent = 'Close';
+        close.style.cssText = reset.style.cssText;
+        close.onclick = (ev) => {
+            ev.stopPropagation();
+            closeSettingsMenus();
+        };
+
+        links.appendChild(github);
+        links.appendChild(reset);
+        links.appendChild(close);
+        menu.appendChild(links);
+
+        const note = document.createElement('div');
+        note.textContent = 'Settings are saved in this browser only.';
+        note.style.cssText = 'font-size: 10px; color: #888; margin-top: 8px;';
+        menu.appendChild(note);
+
+        return menu;
+    }
+
+    function makeSelectRow(labelText, settingName, values, suffix, afterChange) {
+        const row = document.createElement('label');
+        row.style.cssText = 'display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 7px 0;';
+
+        const label = document.createElement('span');
+        label.textContent = labelText;
+        label.style.cssText = 'color: #ccc;';
+
+        const select = document.createElement('select');
+        select.style.cssText = 'background: #222; color: #eee; border: 1px solid #666; border-radius: 4px; padding: 2px 4px;';
+
+        values.forEach(value => {
+            const option = document.createElement('option');
+            option.value = String(value);
+            option.textContent = suffix ? `${value} ${suffix}` : String(value);
+            if (settings[settingName] === value) option.selected = true;
+            select.appendChild(option);
+        });
+
+        select.onchange = () => {
+            settings[settingName] = Number(select.value);
+            saveSettings();
+            if (typeof afterChange === 'function') afterChange();
+        };
+
+        row.appendChild(label);
+        row.appendChild(select);
+        return row;
+    }
+
+    document.addEventListener('click', (ev) => {
+        if (!ev.target.closest || !ev.target.closest('.vidokoun-settings-menu')) closeSettingsMenus();
+    }, true);
+
     function registerSocialBlobVideo(record) {
         loadedSocialBlobs.push(record);
         cleanupSocialBlobs();
@@ -343,7 +511,7 @@
     }
 
     function cleanupSocialBlobs() {
-        while (loadedSocialBlobs.length > MAX_LOADED_SOCIAL_BLOBS) {
+        while (loadedSocialBlobs.length > settings.maxLoadedBlobs) {
             const oldest = loadedSocialBlobs.shift();
             if (oldest && typeof oldest.unload === 'function') oldest.unload();
         }
@@ -397,11 +565,8 @@
         video.playsInline = true;
         video.setAttribute('data-vidokoun-node', '1');
         video.style.cssText = [
-            'width: 100%;',
-            service.style || 'aspect-ratio: 16/9;',
-            'border-radius: 4px;',
-            'box-shadow: 0 2px 8px rgba(0,0,0,0.2);',
-            'background: #000;'
+            'width: 100%;', service.style || 'aspect-ratio: 16/9;',
+            'border-radius: 4px;', 'box-shadow: 0 2px 8px rgba(0,0,0,0.2);', 'background: #000;'
         ].join(' ');
 
         let unloaded = false;
@@ -516,12 +681,14 @@
         const placeholder = document.createElement('div');
         placeholder.setAttribute('data-vidokoun-node', '1');
         placeholder.style.cssText = [
-            'width: 100%;', service.style, 'background-color: #1a1a1a;', 'border-radius: 4px;',
+            'position: relative;', 'width: 100%;', service.style, 'background-color: #1a1a1a;', 'border-radius: 4px;',
             'display: flex;', 'align-items: center;', 'justify-content: center;', 'cursor: pointer;',
             'box-shadow: 0 2px 8px rgba(0,0,0,0.2);', 'transition: background 0.2s ease;',
             'background-position: center;', 'background-size: cover;'
         ].join(' ');
         if (service.name === 'YouTube') placeholder.style.backgroundImage = `url(https://i.ytimg.com/vi/${id}/hqdefault.jpg)`;
+
+        placeholder.appendChild(makeSettingsButton());
 
         const playBtn = document.createElement('div');
         playBtn.className = 'vidokoun-play';
@@ -533,6 +700,7 @@
 
         placeholder.addEventListener('click', async function() {
             if (this.dataset.vidokounLoading === '1') return;
+            closeSettingsMenus();
             this.dataset.vidokounLoading = '1';
             playBtn.textContent = 'Loading...';
             playBtn.style.background = 'rgba(100, 100, 100, 0.9)';
