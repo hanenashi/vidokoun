@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         vidokoun
 // @namespace    http://tampermonkey.net/
-// @version      1.1.4
+// @version      1.1.5
 // @description  Lazy-loads videos, tries cancelable GM blob loading for Twitter/X, Instagram, and Facebook, auto-cleans old blobs, and falls back to embeds
 // @author       hanenashi
 // @match        *://*.okoun.cz/*
@@ -30,14 +30,14 @@
     'use strict';
 
     const DEBUG = false;
-    const APP_VERSION = '1.1.4';
+    const APP_VERSION = '1.1.5';
     const GITHUB_URL = 'https://github.com/hanenashi/vidokoun';
     const SETTINGS_KEY = 'vidokoun.settings.v1';
     const MAX_WIDTH = '550px';
     const BLOB_DOWNLOAD_TIMEOUT = 30000;
 
     const DEFAULT_SETTINGS = {
-        maxBlobMb: 80,
+        maxBlobMb: 80,       // 0 means no limit
         maxLoadedBlobs: 3
     };
 
@@ -48,14 +48,29 @@
         if (DEBUG) console.log('[vidokoun]', ...args);
     }
 
+    function sanitizeChoice(value, allowed, fallback) {
+        const n = Number(value);
+        return allowed.includes(n) ? n : fallback;
+    }
+
     function loadSettings() {
         try {
             const raw = localStorage.getItem(SETTINGS_KEY);
             if (!raw) return { ...DEFAULT_SETTINGS };
+
             const parsed = JSON.parse(raw);
+
             return {
-                maxBlobMb: sanitizeChoice(parsed.maxBlobMb, [25, 50, 80, 120, 200], DEFAULT_SETTINGS.maxBlobMb),
-                maxLoadedBlobs: sanitizeChoice(parsed.maxLoadedBlobs, [1, 2, 3, 5], DEFAULT_SETTINGS.maxLoadedBlobs)
+                maxBlobMb: sanitizeChoice(
+                    parsed.maxBlobMb,
+                    [0, 25, 50, 80, 120, 200],
+                    DEFAULT_SETTINGS.maxBlobMb
+                ),
+                maxLoadedBlobs: sanitizeChoice(
+                    parsed.maxLoadedBlobs,
+                    [1, 2, 3, 5],
+                    DEFAULT_SETTINGS.maxLoadedBlobs
+                )
             };
         } catch (e) {
             return { ...DEFAULT_SETTINGS };
@@ -70,17 +85,15 @@
         }
     }
 
-    function sanitizeChoice(value, allowed, fallback) {
-        const n = Number(value);
-        return allowed.includes(n) ? n : fallback;
-    }
-
     function maxBlobBytes() {
+        if (settings.maxBlobMb === 0) return Infinity;
         return settings.maxBlobMb * 1024 * 1024;
     }
 
     function formatBytes(bytes) {
+        if (bytes === Infinity) return 'No limit';
         if (!Number.isFinite(bytes) || bytes <= 0) return '? MB';
+
         const mb = bytes / 1024 / 1024;
         if (mb >= 10) return `${Math.round(mb)} MB`;
         return `${mb.toFixed(1)} MB`;
@@ -89,20 +102,26 @@
     function getResponseHeader(responseHeaders, name) {
         const wanted = String(name).toLowerCase();
         const lines = String(responseHeaders || '').split(/\r?\n/);
+
         for (const line of lines) {
             const idx = line.indexOf(':');
             if (idx === -1) continue;
+
             const key = line.slice(0, idx).trim().toLowerCase();
             if (key === wanted) return line.slice(idx + 1).trim();
         }
+
         return null;
     }
 
     function gmRequest(details) {
-        if (typeof GM_xmlhttpRequest === 'function') return GM_xmlhttpRequest(details);
+        if (typeof GM_xmlhttpRequest === 'function') {
+            return GM_xmlhttpRequest(details);
+        }
 
         if (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function') {
             const result = GM.xmlHttpRequest(details);
+
             if (result && typeof result.then === 'function') {
                 result.then((res) => {
                     if (typeof details.onload === 'function') details.onload(res);
@@ -110,6 +129,7 @@
                     if (typeof details.onerror === 'function') details.onerror(err);
                 });
             }
+
             return result;
         }
 
@@ -122,11 +142,20 @@
                 method: 'GET',
                 url,
                 timeout,
-                headers: { 'Accept': 'application/json,text/plain,*/*' },
+                headers: {
+                    'Accept': 'application/json,text/plain,*/*'
+                },
                 onload: (res) => {
-                    if (res.status < 200 || res.status >= 300) return reject(new Error(`HTTP ${res.status}`));
-                    try { resolve(JSON.parse(res.responseText)); }
-                    catch (e) { reject(new Error('Bad JSON response')); }
+                    if (res.status < 200 || res.status >= 300) {
+                        reject(new Error(`HTTP ${res.status}`));
+                        return;
+                    }
+
+                    try {
+                        resolve(JSON.parse(res.responseText));
+                    } catch (e) {
+                        reject(new Error('Bad JSON response'));
+                    }
                 },
                 onerror: () => reject(new Error('GM JSON request failed')),
                 ontimeout: () => reject(new Error('GM JSON request timeout'))
@@ -145,7 +174,11 @@
                     'Referer': referer || url
                 },
                 onload: (res) => {
-                    if (res.status < 200 || res.status >= 300) return reject(new Error(`HTML HTTP ${res.status}`));
+                    if (res.status < 200 || res.status >= 300) {
+                        reject(new Error(`HTML HTTP ${res.status}`));
+                        return;
+                    }
+
                     resolve(res.responseText || '');
                 },
                 onerror: () => reject(new Error('GM HTML request failed')),
@@ -178,39 +211,58 @@
                     },
                     onprogress: (ev) => {
                         if (aborted || settled) return;
+
                         const loaded = ev && Number.isFinite(ev.loaded) ? ev.loaded : 0;
                         const total = ev && ev.lengthComputable && Number.isFinite(ev.total) ? ev.total : 0;
                         const limit = maxBlobBytes();
 
-                        if (total > limit || loaded > limit) {
+                        if (Number.isFinite(limit) && (total > limit || loaded > limit)) {
                             aborted = true;
                             if (req && typeof req.abort === 'function') req.abort();
+
                             fail(new Error(`Video too large for safe blob load (${formatBytes(Math.max(total, loaded))})`));
                             return;
                         }
 
-                        if (typeof onProgress === 'function') onProgress({ loaded, total });
+                        if (typeof onProgress === 'function') {
+                            onProgress({ loaded, total });
+                        }
                     },
                     onload: (res) => {
                         if (aborted || settled) return;
-                        if (res.status < 200 || res.status >= 300) return fail(new Error(`MP4 HTTP ${res.status}`));
+
+                        if (res.status < 200 || res.status >= 300) {
+                            fail(new Error(`MP4 HTTP ${res.status}`));
+                            return;
+                        }
 
                         const limit = maxBlobBytes();
                         const contentLength = Number(getResponseHeader(res.responseHeaders, 'content-length'));
-                        if (Number.isFinite(contentLength) && contentLength > limit) {
-                            return fail(new Error(`Video too large for safe blob load (${formatBytes(contentLength)})`));
+
+                        if (Number.isFinite(limit) && Number.isFinite(contentLength) && contentLength > limit) {
+                            fail(new Error(`Video too large for safe blob load (${formatBytes(contentLength)})`));
+                            return;
                         }
 
-                        if (!res.response || !res.response.size) return fail(new Error('Empty MP4 blob'));
-                        if (res.response.size > limit) {
-                            return fail(new Error(`Video too large for safe blob load (${formatBytes(res.response.size)})`));
+                        if (!res.response || !res.response.size) {
+                            fail(new Error('Empty MP4 blob'));
+                            return;
+                        }
+
+                        if (Number.isFinite(limit) && res.response.size > limit) {
+                            fail(new Error(`Video too large for safe blob load (${formatBytes(res.response.size)})`));
+                            return;
                         }
 
                         settled = true;
                         resolve(URL.createObjectURL(res.response));
                     },
-                    onerror: () => { if (!aborted) fail(new Error('GM MP4 request failed')); },
-                    ontimeout: () => { if (!aborted) fail(new Error('GM MP4 request timeout')); }
+                    onerror: () => {
+                        if (!aborted) fail(new Error('GM MP4 request failed'));
+                    },
+                    ontimeout: () => {
+                        if (!aborted) fail(new Error('GM MP4 request timeout'));
+                    }
                 });
             } catch (e) {
                 fail(e);
@@ -222,7 +274,10 @@
             abort: () => {
                 if (settled || aborted) return;
                 aborted = true;
-                if (req && typeof req.abort === 'function') req.abort();
+
+                if (req && typeof req.abort === 'function') {
+                    req.abort();
+                }
             }
         };
     }
@@ -235,7 +290,9 @@
 
     function looseDecodeUrl(str) {
         if (!str) return '';
+
         let out = String(str);
+
         for (let i = 0; i < 3; i++) {
             out = htmlDecode(out)
                 .replace(/\\\//g, '/')
@@ -245,8 +302,14 @@
                 .replace(/\\u003f/gi, '?')
                 .replace(/\\u002f/gi, '/')
                 .replace(/\\u003a/gi, ':');
-            try { out = decodeURIComponent(out); } catch (e) { /* keep partial */ }
+
+            try {
+                out = decodeURIComponent(out);
+            } catch (e) {
+                // keep partial
+            }
         }
+
         return out;
     }
 
@@ -256,6 +319,7 @@
 
     function extractFirstMp4FromHtml(html) {
         if (!html) return null;
+
         const patterns = [
             /<meta[^>]+(?:property|name)=["']og:video(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i,
             /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:video(?::secure_url)?["']/i,
@@ -275,9 +339,11 @@
         for (const pattern of patterns) {
             const match = html.match(pattern);
             if (!match || !match[1]) continue;
+
             const decoded = looseDecodeUrl(match[1]);
             if (looksLikeMp4Url(decoded)) return decoded;
         }
+
         return null;
     }
 
@@ -285,7 +351,14 @@
         const iframe = document.createElement('iframe');
         iframe.setAttribute('data-vidokoun-node', '1');
         iframe.src = `https://platform.twitter.com/embed/Tweet.html?id=${encodeURIComponent(id)}`;
-        iframe.style.cssText = 'width: 100%; height: 460px; resize: vertical; border: none; border-radius: 4px; background: #fff;';
+        iframe.style.cssText = [
+            'width: 100%;',
+            'height: 460px;',
+            'resize: vertical;',
+            'border: none;',
+            'border-radius: 4px;',
+            'background: #fff;'
+        ].join(' ');
         iframe.allowFullscreen = true;
         iframe.allow = 'autoplay; fullscreen; picture-in-picture';
         return iframe;
@@ -295,7 +368,14 @@
         const iframe = document.createElement('iframe');
         iframe.setAttribute('data-vidokoun-node', '1');
         iframe.src = `https://www.instagram.com/${type}/${encodeURIComponent(shortcode)}/embed/`;
-        iframe.style.cssText = 'width: 100%; height: 560px; resize: vertical; border: none; border-radius: 4px; background: #fff;';
+        iframe.style.cssText = [
+            'width: 100%;',
+            'height: 560px;',
+            'resize: vertical;',
+            'border: none;',
+            'border-radius: 4px;',
+            'background: #fff;'
+        ].join(' ');
         iframe.allowFullscreen = true;
         iframe.allow = 'autoplay; fullscreen; picture-in-picture';
         return iframe;
@@ -305,7 +385,14 @@
         const iframe = document.createElement('iframe');
         iframe.setAttribute('data-vidokoun-node', '1');
         iframe.src = `https://www.facebook.com/plugins/video.php?href=${encodeURIComponent(originalUrl)}&show_text=false&width=550`;
-        iframe.style.cssText = 'width: 100%; height: 460px; resize: vertical; border: none; border-radius: 4px; background: #fff;';
+        iframe.style.cssText = [
+            'width: 100%;',
+            'height: 460px;',
+            'resize: vertical;',
+            'border: none;',
+            'border-radius: 4px;',
+            'background: #fff;'
+        ].join(' ');
         iframe.allowFullscreen = true;
         iframe.allow = 'autoplay; encrypted-media; fullscreen; picture-in-picture';
         return iframe;
@@ -315,11 +402,20 @@
         const panel = document.createElement('div');
         panel.setAttribute('data-vidokoun-node', '1');
         panel.style.cssText = [
-            'width: 100%;', service.style || 'aspect-ratio: 16/9;',
-            'background: #1a1a1a;', 'color: #ddd;', 'border-radius: 4px;',
-            'display: flex;', 'align-items: center;', 'justify-content: center;',
-            'font-family: sans-serif;', 'font-size: 13px;', 'text-align: center;',
-            'padding: 12px;', 'box-sizing: border-box;', 'box-shadow: 0 2px 8px rgba(0,0,0,0.2);'
+            'width: 100%;',
+            service.style || 'aspect-ratio: 16/9;',
+            'background: #1a1a1a;',
+            'color: #ddd;',
+            'border-radius: 4px;',
+            'display: flex;',
+            'align-items: center;',
+            'justify-content: center;',
+            'font-family: sans-serif;',
+            'font-size: 13px;',
+            'text-align: center;',
+            'padding: 12px;',
+            'box-sizing: border-box;',
+            'box-shadow: 0 2px 8px rgba(0,0,0,0.2);'
         ].join(' ');
 
         const box = document.createElement('div');
@@ -338,7 +434,15 @@
         const cancel = document.createElement('button');
         cancel.type = 'button';
         cancel.textContent = 'Cancel';
-        cancel.style.cssText = 'font-size: 12px; padding: 5px 12px; cursor: pointer; border-radius: 4px; border: 1px solid #777; background: #333; color: #eee;';
+        cancel.style.cssText = [
+            'font-size: 12px;',
+            'padding: 5px 12px;',
+            'cursor: pointer;',
+            'border-radius: 4px;',
+            'border: 1px solid #777;',
+            'background: #333;',
+            'color: #eee;'
+        ].join(' ');
 
         const original = document.createElement('a');
         original.href = originalUrl;
@@ -356,15 +460,46 @@
 
         return {
             panel,
-            setStatus: (text) => { status.textContent = text; },
-            setHint: (text) => { hint.textContent = text; },
-            setCancel: (fn) => { cancel.onclick = fn; },
-            disableCancel: () => { cancel.disabled = true; cancel.style.opacity = '0.5'; cancel.style.cursor = 'default'; }
+            setStatus: (text) => {
+                status.textContent = text;
+            },
+            setHint: (text) => {
+                hint.textContent = text;
+            },
+            setCancel: (fn) => {
+                cancel.onclick = fn;
+            },
+            disableCancel: () => {
+                cancel.disabled = true;
+                cancel.style.opacity = '0.5';
+                cancel.style.cursor = 'default';
+            }
         };
     }
 
     function closeSettingsMenus() {
         document.querySelectorAll('.vidokoun-settings-menu').forEach(menu => menu.remove());
+    }
+
+    function positionSettingsMenu(menu, button) {
+        const rect = button.getBoundingClientRect();
+        const margin = 8;
+        const width = Math.min(270, Math.max(230, window.innerWidth - margin * 2));
+
+        menu.style.width = `${width}px`;
+
+        let left = rect.right - width;
+        left = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
+
+        let top = rect.bottom + margin;
+        const approxHeight = 235;
+
+        if (top + approxHeight > window.innerHeight) {
+            top = Math.max(margin, rect.top - approxHeight - margin);
+        }
+
+        menu.style.left = `${left}px`;
+        menu.style.top = `${top}px`;
     }
 
     function makeSettingsButton() {
@@ -373,43 +508,82 @@
         btn.textContent = 'settings';
         btn.title = 'vidokoun settings';
         btn.setAttribute('data-vidokoun-node', '1');
+        btn.dataset.vidokounMenuOwner = `${Date.now()}-${Math.random()}`;
+
         btn.style.cssText = [
-            'position: absolute;', 'top: 6px;', 'right: 6px;', 'z-index: 5;',
-            'font-family: sans-serif;', 'font-size: 10px;', 'line-height: 1;',
-            'padding: 4px 6px;', 'border-radius: 999px;', 'border: 1px solid rgba(255,255,255,0.25);',
-            'background: rgba(0,0,0,0.62);', 'color: #ddd;', 'cursor: pointer;',
+            'position: absolute;',
+            'top: 6px;',
+            'right: 6px;',
+            'z-index: 5;',
+            'font-family: sans-serif;',
+            'font-size: 10px;',
+            'line-height: 1;',
+            'padding: 4px 6px;',
+            'border-radius: 999px;',
+            'border: 1px solid rgba(255,255,255,0.25);',
+            'background: rgba(0,0,0,0.62);',
+            'color: #ddd;',
+            'cursor: pointer;',
             'opacity: 0.72;'
         ].join(' ');
 
         btn.addEventListener('click', (ev) => {
             ev.preventDefault();
             ev.stopPropagation();
-            const host = btn.closest('[data-vidokoun-node="1"]');
-            if (!host) return;
 
-            const existing = host.querySelector('.vidokoun-settings-menu');
+            const old = document.querySelector('.vidokoun-settings-menu');
+            const sameOwner = old && old.dataset.ownerButton === btn.dataset.vidokounMenuOwner;
+
             closeSettingsMenus();
-            if (existing) return;
+
+            if (sameOwner) return;
 
             const menu = makeSettingsMenu();
-            host.appendChild(menu);
+            menu.dataset.ownerButton = btn.dataset.vidokounMenuOwner;
+
+            document.body.appendChild(menu);
+            positionSettingsMenu(menu, btn);
         });
 
         return btn;
+    }
+
+    function makeSmallButton(text) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = text;
+        button.style.cssText = [
+            'font-size: 11px;',
+            'padding: 3px 7px;',
+            'border-radius: 4px;',
+            'border: 1px solid #666;',
+            'background: #2b2b2b;',
+            'color: #ddd;',
+            'cursor: pointer;'
+        ].join(' ');
+        return button;
     }
 
     function makeSettingsMenu() {
         const menu = document.createElement('div');
         menu.className = 'vidokoun-settings-menu';
         menu.setAttribute('data-vidokoun-node', '1');
+
         menu.style.cssText = [
-            'position: absolute;', 'top: 34px;', 'right: 6px;', 'z-index: 20;',
-            'width: 230px;', 'max-width: calc(100% - 12px);',
-            'background: rgba(18,18,18,0.96);', 'color: #eee;',
-            'border: 1px solid rgba(255,255,255,0.22);', 'border-radius: 8px;',
+            'position: fixed;',
+            'z-index: 2147483647;',
+            'background: rgba(18,18,18,0.97);',
+            'color: #eee;',
+            'border: 1px solid rgba(255,255,255,0.22);',
+            'border-radius: 8px;',
             'box-shadow: 0 4px 18px rgba(0,0,0,0.45);',
-            'font-family: sans-serif;', 'font-size: 12px;', 'text-align: left;',
-            'padding: 10px;', 'box-sizing: border-box;', 'cursor: default;'
+            'font-family: sans-serif;',
+            'font-size: 12px;',
+            'text-align: left;',
+            'padding: 10px;',
+            'box-sizing: border-box;',
+            'cursor: default;',
+            'line-height: 1.3;'
         ].join(' ');
 
         menu.addEventListener('click', (ev) => ev.stopPropagation());
@@ -419,11 +593,24 @@
         title.style.cssText = 'font-weight: bold; margin-bottom: 8px;';
         menu.appendChild(title);
 
-        menu.appendChild(makeSelectRow('Blob size limit', 'maxBlobMb', [25, 50, 80, 120, 200], 'MB', () => {}));
-        menu.appendChild(makeSelectRow('Loaded blob videos', 'maxLoadedBlobs', [1, 2, 3, 5], '', cleanupSocialBlobs));
+        menu.appendChild(makeSelectRow(
+            'Blob size limit',
+            'maxBlobMb',
+            [0, 25, 50, 80, 120, 200],
+            'MB',
+            () => {}
+        ));
+
+        menu.appendChild(makeSelectRow(
+            'Loaded blob videos',
+            'maxLoadedBlobs',
+            [1, 2, 3, 5],
+            '',
+            cleanupSocialBlobs
+        ));
 
         const links = document.createElement('div');
-        links.style.cssText = 'display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px;';
+        links.style.cssText = 'display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px;';
 
         const github = document.createElement('a');
         github.href = GITHUB_URL;
@@ -432,10 +619,7 @@
         github.textContent = 'GitHub';
         github.style.cssText = 'color: #aaa;';
 
-        const reset = document.createElement('button');
-        reset.type = 'button';
-        reset.textContent = 'Reset';
-        reset.style.cssText = 'font-size: 11px; padding: 3px 7px; border-radius: 4px; border: 1px solid #666; background: #2b2b2b; color: #ddd; cursor: pointer;';
+        const reset = makeSmallButton('Reset');
         reset.onclick = (ev) => {
             ev.stopPropagation();
             settings = { ...DEFAULT_SETTINGS };
@@ -444,10 +628,7 @@
             closeSettingsMenus();
         };
 
-        const close = document.createElement('button');
-        close.type = 'button';
-        close.textContent = 'Close';
-        close.style.cssText = reset.style.cssText;
+        const close = makeSmallButton('Close');
         close.onclick = (ev) => {
             ev.stopPropagation();
             closeSettingsMenus();
@@ -468,19 +649,37 @@
 
     function makeSelectRow(labelText, settingName, values, suffix, afterChange) {
         const row = document.createElement('label');
-        row.style.cssText = 'display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 7px 0;';
+        row.style.cssText = [
+            'display: flex;',
+            'align-items: center;',
+            'justify-content: space-between;',
+            'gap: 8px;',
+            'margin: 7px 0;'
+        ].join(' ');
 
         const label = document.createElement('span');
         label.textContent = labelText;
         label.style.cssText = 'color: #ccc;';
 
         const select = document.createElement('select');
-        select.style.cssText = 'background: #222; color: #eee; border: 1px solid #666; border-radius: 4px; padding: 2px 4px;';
+        select.style.cssText = [
+            'background: #222;',
+            'color: #eee;',
+            'border: 1px solid #666;',
+            'border-radius: 4px;',
+            'padding: 2px 4px;'
+        ].join(' ');
 
         values.forEach(value => {
             const option = document.createElement('option');
             option.value = String(value);
-            option.textContent = suffix ? `${value} ${suffix}` : String(value);
+
+            if (settingName === 'maxBlobMb' && value === 0) {
+                option.textContent = 'No limit';
+            } else {
+                option.textContent = suffix ? `${value} ${suffix}` : String(value);
+            }
+
             if (settings[settingName] === value) option.selected = true;
             select.appendChild(option);
         });
@@ -488,7 +687,10 @@
         select.onchange = () => {
             settings[settingName] = Number(select.value);
             saveSettings();
-            if (typeof afterChange === 'function') afterChange();
+
+            if (typeof afterChange === 'function') {
+                afterChange();
+            }
         };
 
         row.appendChild(label);
@@ -497,8 +699,13 @@
     }
 
     document.addEventListener('click', (ev) => {
-        if (!ev.target.closest || !ev.target.closest('.vidokoun-settings-menu')) closeSettingsMenus();
+        if (!ev.target.closest || !ev.target.closest('.vidokoun-settings-menu')) {
+            closeSettingsMenus();
+        }
     }, true);
+
+    window.addEventListener('scroll', closeSettingsMenus, true);
+    window.addEventListener('resize', closeSettingsMenus, true);
 
     function registerSocialBlobVideo(record) {
         loadedSocialBlobs.push(record);
@@ -513,14 +720,18 @@
     function cleanupSocialBlobs() {
         while (loadedSocialBlobs.length > settings.maxLoadedBlobs) {
             const oldest = loadedSocialBlobs.shift();
-            if (oldest && typeof oldest.unload === 'function') oldest.unload();
+            if (oldest && typeof oldest.unload === 'function') {
+                oldest.unload();
+            }
         }
     }
 
     function revokeAllSocialBlobs() {
         while (loadedSocialBlobs.length) {
             const item = loadedSocialBlobs.shift();
-            if (item && typeof item.unload === 'function') item.unload(true);
+            if (item && typeof item.unload === 'function') {
+                item.unload(true);
+            }
         }
     }
 
@@ -530,25 +741,38 @@
 
         let cancelled = false;
         let blobUrl = null;
+
         const download = gmGetBlobUrlAbortable(videoUrl, referer, BLOB_DOWNLOAD_TIMEOUT, ({ loaded, total }) => {
-            if (total > 0) loading.setStatus(`Downloading ${service.name}... ${formatBytes(loaded)} / ${formatBytes(total)}`);
-            else if (loaded > 0) loading.setStatus(`Downloading ${service.name}... ${formatBytes(loaded)}`);
+            if (total > 0) {
+                loading.setStatus(`Downloading ${service.name}... ${formatBytes(loaded)} / ${formatBytes(total)}`);
+            } else if (loaded > 0) {
+                loading.setStatus(`Downloading ${service.name}... ${formatBytes(loaded)}`);
+            }
         });
 
         loading.setCancel(() => {
             cancelled = true;
             download.abort();
-            if (loading.panel.isConnected) loading.panel.replaceWith(createPlaceholder(service, match, originalUrl));
+
+            if (loading.panel.isConnected) {
+                loading.panel.replaceWith(createPlaceholder(service, match, originalUrl));
+            }
         });
 
         try {
             blobUrl = await download.promise;
         } catch (e) {
             log(`${service.name} blob download failed:`, e);
+
             if (cancelled) return;
+
             loading.setStatus(`${service.name} blob load failed. Opening fallback...`);
             loading.disableCancel();
-            if (loading.panel.isConnected && fallbackNodeFactory) loading.panel.replaceWith(fallbackNodeFactory());
+
+            if (loading.panel.isConnected && fallbackNodeFactory) {
+                loading.panel.replaceWith(fallbackNodeFactory());
+            }
+
             return;
         }
 
@@ -565,29 +789,51 @@
         video.playsInline = true;
         video.setAttribute('data-vidokoun-node', '1');
         video.style.cssText = [
-            'width: 100%;', service.style || 'aspect-ratio: 16/9;',
-            'border-radius: 4px;', 'box-shadow: 0 2px 8px rgba(0,0,0,0.2);', 'background: #000;'
+            'width: 100%;',
+            service.style || 'aspect-ratio: 16/9;',
+            'border-radius: 4px;',
+            'box-shadow: 0 2px 8px rgba(0,0,0,0.2);',
+            'background: #000;'
         ].join(' ');
 
         let unloaded = false;
+
         const record = {
             blobUrl,
             video,
             unload: (pageLeaving = false) => {
                 if (unloaded) return;
                 unloaded = true;
-                try { video.pause(); } catch (e) { /* ignore */ }
+
+                try {
+                    video.pause();
+                } catch (e) {
+                    // ignore
+                }
+
                 video.removeAttribute('src');
-                try { video.load(); } catch (e) { /* ignore */ }
+
+                try {
+                    video.load();
+                } catch (e) {
+                    // ignore
+                }
+
                 URL.revokeObjectURL(blobUrl);
                 unregisterSocialBlobVideo(record);
-                if (!pageLeaving && video.isConnected) video.replaceWith(createPlaceholder(service, match, originalUrl));
+
+                if (!pageLeaving && video.isConnected) {
+                    video.replaceWith(createPlaceholder(service, match, originalUrl));
+                }
             }
         };
 
         video.addEventListener('error', () => {
             record.unload(true);
-            if (video.isConnected && fallbackNodeFactory) video.replaceWith(fallbackNodeFactory());
+
+            if (video.isConnected && fallbackNodeFactory) {
+                video.replaceWith(fallbackNodeFactory());
+            }
         }, { once: true });
 
         if (loading.panel.isConnected) {
@@ -618,11 +864,27 @@
             customAction: async (placeholderNode, match, originalUrl, service) => {
                 const username = match[1];
                 const id = match[2];
+
                 try {
                     const data = await gmGetJson(`https://api.vxtwitter.com/${encodeURIComponent(username)}/status/${encodeURIComponent(id)}`);
-                    const videoUrl = (data.mediaURLs || []).find(url => /\.mp4(?:\?|$)/i.test(url)) || (data.media_extended || []).map(m => m.url).find(url => /\.mp4(?:\?|$)/i.test(url));
-                    if (!videoUrl) throw new Error('No MP4 found in tweet');
-                    await insertBlobVideo({ placeholderNode, match, originalUrl, service, videoUrl, referer: 'https://x.com/', fallbackNodeFactory: () => makeTwitterIframe(id) });
+
+                    const videoUrl =
+                        (data.mediaURLs || []).find(url => /\.mp4(?:\?|$)/i.test(url)) ||
+                        (data.media_extended || []).map(m => m.url).find(url => /\.mp4(?:\?|$)/i.test(url));
+
+                    if (!videoUrl) {
+                        throw new Error('No MP4 found in tweet');
+                    }
+
+                    await insertBlobVideo({
+                        placeholderNode,
+                        match,
+                        originalUrl,
+                        service,
+                        videoUrl,
+                        referer: 'https://x.com/',
+                        fallbackNodeFactory: () => makeTwitterIframe(id)
+                    });
                 } catch (e) {
                     log('Twitter/X GM blob load failed, falling back to iframe:', e);
                     placeholderNode.replaceWith(makeTwitterIframe(id));
@@ -636,11 +898,24 @@
             customAction: async (placeholderNode, match, originalUrl, service) => {
                 const type = match[1];
                 const shortcode = match[2];
+
                 try {
                     const html = await gmGetText(originalUrl, 'https://www.instagram.com/');
                     const videoUrl = extractFirstMp4FromHtml(html);
-                    if (!videoUrl) throw new Error('No MP4 found in Instagram page');
-                    await insertBlobVideo({ placeholderNode, match, originalUrl, service, videoUrl, referer: 'https://www.instagram.com/', fallbackNodeFactory: () => makeInstagramIframe(shortcode, type) });
+
+                    if (!videoUrl) {
+                        throw new Error('No MP4 found in Instagram page');
+                    }
+
+                    await insertBlobVideo({
+                        placeholderNode,
+                        match,
+                        originalUrl,
+                        service,
+                        videoUrl,
+                        referer: 'https://www.instagram.com/',
+                        fallbackNodeFactory: () => makeInstagramIframe(shortcode, type)
+                    });
                 } catch (e) {
                     log('Instagram GM blob load failed, falling back to iframe:', e);
                     placeholderNode.replaceWith(makeInstagramIframe(shortcode, type));
@@ -655,8 +930,20 @@
                 try {
                     const html = await gmGetText(originalUrl, 'https://www.facebook.com/');
                     const videoUrl = extractFirstMp4FromHtml(html);
-                    if (!videoUrl) throw new Error('No MP4 found in Facebook page');
-                    await insertBlobVideo({ placeholderNode, match, originalUrl, service, videoUrl, referer: 'https://www.facebook.com/', fallbackNodeFactory: () => makeFacebookIframe(originalUrl) });
+
+                    if (!videoUrl) {
+                        throw new Error('No MP4 found in Facebook page');
+                    }
+
+                    await insertBlobVideo({
+                        placeholderNode,
+                        match,
+                        originalUrl,
+                        service,
+                        videoUrl,
+                        referer: 'https://www.facebook.com/',
+                        fallbackNodeFactory: () => makeFacebookIframe(originalUrl)
+                    });
                 } catch (e) {
                     log('Facebook GM blob load failed, falling back to iframe:', e);
                     placeholderNode.replaceWith(makeFacebookIframe(originalUrl));
@@ -677,30 +964,65 @@
     }
 
     function createPlaceholder(service, match, originalUrl) {
-        const id = service.name === 'Twitter/X' ? match[2] : (service.name === 'Instagram' ? match[2] : match[1]);
+        const id = service.name === 'Twitter/X'
+            ? match[2]
+            : (service.name === 'Instagram' ? match[2] : match[1]);
+
         const placeholder = document.createElement('div');
         placeholder.setAttribute('data-vidokoun-node', '1');
         placeholder.style.cssText = [
-            'position: relative;', 'width: 100%;', service.style, 'background-color: #1a1a1a;', 'border-radius: 4px;',
-            'display: flex;', 'align-items: center;', 'justify-content: center;', 'cursor: pointer;',
-            'box-shadow: 0 2px 8px rgba(0,0,0,0.2);', 'transition: background 0.2s ease;',
-            'background-position: center;', 'background-size: cover;'
+            'position: relative;',
+            'width: 100%;',
+            service.style,
+            'background-color: #1a1a1a;',
+            'border-radius: 4px;',
+            'display: flex;',
+            'align-items: center;',
+            'justify-content: center;',
+            'cursor: pointer;',
+            'box-shadow: 0 2px 8px rgba(0,0,0,0.2);',
+            'transition: background 0.2s ease;',
+            'background-position: center;',
+            'background-size: cover;'
         ].join(' ');
-        if (service.name === 'YouTube') placeholder.style.backgroundImage = `url(https://i.ytimg.com/vi/${id}/hqdefault.jpg)`;
+
+        if (service.name === 'YouTube') {
+            placeholder.style.backgroundImage = `url(https://i.ytimg.com/vi/${id}/hqdefault.jpg)`;
+        }
 
         placeholder.appendChild(makeSettingsButton());
 
         const playBtn = document.createElement('div');
         playBtn.className = 'vidokoun-play';
         playBtn.textContent = `Load ${service.name}`;
-        playBtn.style.cssText = 'background: rgba(0, 0, 0, 0.75); color: #fff; padding: 10px 20px; border-radius: 20px; font-family: sans-serif; font-size: 13px; font-weight: bold; pointer-events: none; border: 1px solid rgba(255,255,255,0.2); transition: all 0.2s;';
-        placeholder.onmouseenter = () => { playBtn.style.background = 'rgba(180, 0, 0, 0.9)'; };
-        placeholder.onmouseleave = () => { playBtn.style.background = 'rgba(0, 0, 0, 0.75)'; };
+        playBtn.style.cssText = [
+            'background: rgba(0, 0, 0, 0.75);',
+            'color: #fff;',
+            'padding: 10px 20px;',
+            'border-radius: 20px;',
+            'font-family: sans-serif;',
+            'font-size: 13px;',
+            'font-weight: bold;',
+            'pointer-events: none;',
+            'border: 1px solid rgba(255,255,255,0.2);',
+            'transition: all 0.2s;'
+        ].join(' ');
+
+        placeholder.onmouseenter = () => {
+            playBtn.style.background = 'rgba(180, 0, 0, 0.9)';
+        };
+
+        placeholder.onmouseleave = () => {
+            playBtn.style.background = 'rgba(0, 0, 0, 0.75)';
+        };
+
         placeholder.appendChild(playBtn);
 
         placeholder.addEventListener('click', async function() {
             if (this.dataset.vidokounLoading === '1') return;
+
             closeSettingsMenus();
+
             this.dataset.vidokounLoading = '1';
             playBtn.textContent = 'Loading...';
             playBtn.style.background = 'rgba(100, 100, 100, 0.9)';
@@ -713,9 +1035,16 @@
             const iframe = document.createElement('iframe');
             iframe.setAttribute('data-vidokoun-node', '1');
             iframe.src = service.getEmbedUrl(id);
-            iframe.style.cssText = ['width: 100%;', service.style, 'border: none;', 'border-radius: 4px;', 'background: white;'].join(' ');
+            iframe.style.cssText = [
+                'width: 100%;',
+                service.style,
+                'border: none;',
+                'border-radius: 4px;',
+                'background: white;'
+            ].join(' ');
             iframe.allowFullscreen = true;
             iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture';
+
             this.replaceWith(iframe);
         });
 
@@ -729,9 +1058,23 @@
         sourceLink.target = '_blank';
         sourceLink.rel = 'noopener noreferrer';
         sourceLink.textContent = `[ Open original ${serviceName} link ]`;
-        sourceLink.style.cssText = 'align-self: flex-end; margin-top: 6px; font-size: 11px; color: #888; text-decoration: none; font-family: sans-serif;';
-        sourceLink.onmouseenter = () => { sourceLink.style.color = '#ccc'; };
-        sourceLink.onmouseleave = () => { sourceLink.style.color = '#888'; };
+        sourceLink.style.cssText = [
+            'align-self: flex-end;',
+            'margin-top: 6px;',
+            'font-size: 11px;',
+            'color: #888;',
+            'text-decoration: none;',
+            'font-family: sans-serif;'
+        ].join(' ');
+
+        sourceLink.onmouseenter = () => {
+            sourceLink.style.color = '#ccc';
+        };
+
+        sourceLink.onmouseleave = () => {
+            sourceLink.style.color = '#888';
+        };
+
         return sourceLink;
     }
 
@@ -755,7 +1098,12 @@
 
             const wrapper = document.createElement('div');
             wrapper.setAttribute('data-vidokoun-node', '1');
-            wrapper.style.cssText = ['margin: 12px 0;', `max-width: ${MAX_WIDTH};`, 'display: flex;', 'flex-direction: column;'].join(' ');
+            wrapper.style.cssText = [
+                'margin: 12px 0;',
+                `max-width: ${MAX_WIDTH};`,
+                'display: flex;',
+                'flex-direction: column;'
+            ].join(' ');
 
             if (service.isNative) {
                 const video = document.createElement('video');
@@ -764,15 +1112,27 @@
                 video.controls = true;
                 video.preload = 'none';
                 video.playsInline = true;
-                video.style.cssText = ['width: 100%;', service.style, 'border-radius: 4px;', 'box-shadow: 0 2px 8px rgba(0,0,0,0.2);'].join(' ');
+                video.style.cssText = [
+                    'width: 100%;',
+                    service.style,
+                    'border-radius: 4px;',
+                    'box-shadow: 0 2px 8px rgba(0,0,0,0.2);'
+                ].join(' ');
                 wrapper.appendChild(video);
             } else {
                 wrapper.appendChild(createPlaceholder(service, match, url));
             }
 
             wrapper.appendChild(makeSourceLink(url, service.name));
-            if (link.parentNode) link.parentNode.insertBefore(wrapper, link.nextSibling);
-            if (link.querySelector('img')) link.style.display = 'none';
+
+            if (link.parentNode) {
+                link.parentNode.insertBefore(wrapper, link.nextSibling);
+            }
+
+            if (link.querySelector('img')) {
+                link.style.display = 'none';
+            }
+
             log('embedded', service.name, url);
             return;
         }
@@ -780,12 +1140,20 @@
         link.dataset.vidokounDone = '1';
     }
 
+    
     function processRoot(root) {
         if (!root) return;
         if (root.nodeType !== 1) return;
         if (isInsideVidokounNode(root)) return;
-        if (root.matches && root.matches('div.content a, .item .content a')) processLink(root);
-        const links = root.querySelectorAll ? root.querySelectorAll('div.content a:not([data-vidokoun-done="1"]), .item .content a:not([data-vidokoun-done="1"])') : [];
+
+        if (root.matches && root.matches('div.content a, .item .content a')) {
+            processLink(root);
+        }
+
+        const links = root.querySelectorAll
+            ? root.querySelectorAll('div.content a:not([data-vidokoun-done="1"]), .item .content a:not([data-vidokoun-done="1"])')
+            : [];
+
         links.forEach(processLink);
     }
 
@@ -795,12 +1163,16 @@
     function scheduleProcess(root) {
         if (!root || root.nodeType !== 1) return;
         if (isInsideVidokounNode(root)) return;
+
         pendingRoots.add(root);
+
         if (scanTimer) return;
+
         scanTimer = setTimeout(() => {
             const roots = Array.from(pendingRoots);
             pendingRoots.clear();
             scanTimer = null;
+
             roots.forEach(processRoot);
         }, 250);
     }
@@ -809,11 +1181,17 @@
 
     const observer = new MutationObserver((mutations) => {
         for (const mut of mutations) {
-            for (const node of mut.addedNodes) scheduleProcess(node);
+            for (const node of mut.addedNodes) {
+                scheduleProcess(node);
+            }
         }
     });
 
-    observer.observe(document.body, { childList: true, subtree: true });
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+
     window.addEventListener('pagehide', revokeAllSocialBlobs, { once: true });
     window.addEventListener('beforeunload', revokeAllSocialBlobs, { once: true });
 })();
