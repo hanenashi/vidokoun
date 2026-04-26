@@ -1,7 +1,7 @@
 # vidokoun
 
 **[Install vidokoun Userscript](https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js)**  
-*(Requires a userscript manager. Tested mainly with Tampermonkey/Kiwi on Android and desktop Chromium-style browsers. v1.1.1 adds a compatibility wrapper for Firefox/Greasemonkey-style `GM.xmlHttpRequest`.)*
+*(Requires a userscript manager. Tested mainly with Tampermonkey/Kiwi on Android and desktop Chromium-style browsers. Firefox/Greasemonkey-style `GM.xmlHttpRequest` is supported through a compatibility wrapper.)*
 
 ## TL;DR
 
@@ -20,17 +20,21 @@ The script does **not** load heavy embeds immediately. It inserts clickable plac
 
 ## Current version
 
-`1.1.1`
+`1.1.5`
 
 Main focus of this version:
 
+- top-right settings button on video placeholders
+- fixed-position settings popup rendered outside the placeholder, so it is not trapped/clipped
+- selectable blob size limit: `25 / 50 / 80 / 120 / 200 MB / No limit`
+- selectable maximum loaded blob videos: `1 / 2 / 3 / 5`
+- version display and GitHub link inside the settings popup
+- persistent browser-local settings via `localStorage`
 - Firefox/Greasemonkey compatibility wrapper for `GM.xmlHttpRequest`
-- keeps Tampermonkey/Kiwi/Chromium support through `GM_xmlhttpRequest`
-- experimental Instagram MP4 extraction from page HTML
-- experimental Facebook MP4 extraction from page HTML
+- Tampermonkey/Kiwi/Chromium support through `GM_xmlhttpRequest`
+- experimental Instagram/Facebook MP4 extraction from page HTML
 - Twitter/X MP4 extraction via `api.vxtwitter.com`
 - blob-loading workaround for CDN/CORS/hotlink issues
-- automatic cleanup of old loaded social blobs after 3 loaded videos
 
 ## Installation
 
@@ -94,7 +98,7 @@ when available.
 
 ### Firefox / Greasemonkey
 
-v1.1.1 adds a compatibility wrapper for newer Greasemonkey-style API:
+Vidokoun also supports newer Greasemonkey-style API:
 
 ```javascript
 GM.xmlHttpRequest(...)
@@ -108,7 +112,7 @@ The wrapper tries APIs in this order:
 3. throw clean error
 ```
 
-Compatibility wrapper:
+Compatibility wrapper, simplified:
 
 ```javascript
 function gmRequest(details) {
@@ -134,7 +138,7 @@ function gmRequest(details) {
 }
 ```
 
-Reality check: Firefox/Greasemonkey API support is now handled, but Meta video extraction can still fail because Facebook/Instagram page HTML and media URLs are intentionally unfriendly. API compatibility does not magically make Meta less cursed.
+Reality check: Firefox/Greasemonkey API support is handled, but Meta video extraction can still fail because Facebook/Instagram page HTML and media URLs are intentionally unfriendly. API compatibility does not magically make Meta less cursed.
 
 ## Technical overview
 
@@ -195,6 +199,39 @@ Only after clicking does it create the actual iframe or video element.
 
 This keeps Okoun listing pages lighter, especially on mobile.
 
+### Placeholder settings menu
+
+Each placeholder has a small top-right `settings` button.
+
+The settings popup is rendered into `document.body` with fixed positioning. This prevents it from being trapped inside the placeholder rectangle on mobile layouts.
+
+The popup includes:
+
+```text
+- vidokoun version
+- Blob size limit: 25 / 50 / 80 / 120 / 200 MB / No limit
+- Loaded blob videos: 1 / 2 / 3 / 5
+- GitHub link
+- Reset
+- Close
+```
+
+Settings are saved with:
+
+```javascript
+localStorage.setItem('vidokoun.settings.v1', JSON.stringify(settings));
+```
+
+No extra userscript storage grant is required.
+
+The settings popup closes automatically on:
+
+```text
+- outside click
+- scroll
+- resize
+```
+
 ### MutationObserver behavior
 
 The script uses a `MutationObserver` to handle posts added dynamically after page load.
@@ -219,11 +256,49 @@ General flow:
 User clicks placeholder
   -> userscript request fetches service metadata/page HTML
   -> script extracts first MP4 URL
+  -> loading panel appears with Cancel button
   -> userscript request downloads MP4 as Blob
   -> URL.createObjectURL(blob) creates local blob: URL
   -> <video src="blob:..."> is inserted
   -> if anything fails, fallback iframe is inserted
 ```
+
+### Cancel button and blob size guard
+
+During social blob downloads, Vidokoun shows a loading panel with:
+
+```text
+- current service name
+- safe limit text
+- Cancel button
+- Open original link
+```
+
+The Cancel button aborts the userscript request where the active userscript manager supports request aborting. It then restores a fresh placeholder.
+
+The blob size guard uses the selected `Blob size limit` setting.
+
+Available limits:
+
+```text
+25 MB
+50 MB
+80 MB   // default
+120 MB
+200 MB
+No limit
+```
+
+`No limit` internally stores `0` and disables the size check:
+
+```javascript
+function maxBlobBytes() {
+    if (settings.maxBlobMb === 0) return Infinity;
+    return settings.maxBlobMb * 1024 * 1024;
+}
+```
+
+Warning: `No limit` means the whole MP4 can be downloaded into memory/blob storage. Useful on a PC, spicy on Pixel/Kiwi. Android may express disagreement by killing the tab.
 
 ### Twitter/X loading flow
 
@@ -286,10 +361,18 @@ https://www.facebook.com/plugins/video.php?href=<encoded_original_url>&show_text
 
 Blob playback is useful, but it has a cost: the whole MP4 is downloaded into memory/blob storage first.
 
-To avoid memory buildup, v1.1.1 keeps only the latest 3 loaded social blob videos alive:
+To avoid memory buildup, Vidokoun keeps only the latest N loaded social blob videos alive, where N is chosen in the placeholder settings menu.
 
-```javascript
-const MAX_LOADED_SOCIAL_BLOBS = 3;
+Default:
+
+```text
+Loaded blob videos: 3
+```
+
+Available values:
+
+```text
+1 / 2 / 3 / 5
 ```
 
 Tracked blob videos include:
@@ -298,7 +381,7 @@ Tracked blob videos include:
 - Instagram blob videos
 - Facebook blob videos
 
-When a 4th social blob video is loaded:
+When the limit is exceeded:
 
 ```text
 oldest loaded social blob video
@@ -342,12 +425,39 @@ Known practical behavior:
 
 - listing pages should stay light because videos are lazy-loaded
 - blob-loaded videos cost real memory
-- only 3 social blob videos are kept loaded at once
+- only the configured number of social blob videos are kept loaded at once
 - older loaded blob videos are automatically replaced back with placeholders
+- size limit defaults to 80 MB
+- `No limit` is available but can be brutal on mobile memory
 - YouTube/Vimeo/Instagram/Facebook iframes are still browser-managed and can be heavier than placeholders after loading
 - Meta extraction may fail frequently; fallback iframe is expected, not a disaster
 
 ## Changelog highlights
+
+### 1.1.5
+
+- Moved settings popup out of the placeholder and into `document.body`.
+- Settings popup now uses `position: fixed` so it is not clipped/trapped by placeholder layout.
+- Added `No limit` option for blob size limit.
+- Added scroll/resize closing behavior for floating settings popup.
+
+### 1.1.4
+
+- Added top-right settings button to placeholders.
+- Added browser-local settings via `localStorage`.
+- Added selectable blob size limit.
+- Added selectable maximum loaded social blob videos.
+- Added version display, GitHub link, Reset, and Close actions.
+
+### 1.1.3
+
+- Loading panel now keeps the same service placeholder size while downloading.
+
+### 1.1.2
+
+- Added cancelable social blob downloads.
+- Added loading panel with Cancel button and Open original link.
+- Added 80 MB default safety guard for blob downloads.
 
 ### 1.1.1
 
@@ -391,6 +501,6 @@ Known practical behavior:
 - Twitter/X behavior depends on `api.vxtwitter.com` and Twitter/X media availability.
 - Instagram/Facebook extraction is best-effort only and can break when Meta changes page structure.
 - Blob loading downloads the whole MP4 before playback; this is not true streaming.
-- Very large videos can still be memory-expensive before cleanup has a chance to help.
+- Very large videos can still be memory-expensive, especially with `No limit` enabled.
 - Some Facebook/Instagram videos may require login, regional access, cookies, or may hide media URLs from page HTML.
 - A real streaming proxy would need an external server; userscript-only code cannot truly proxy server-side traffic.
