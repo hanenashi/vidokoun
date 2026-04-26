@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         vidokoun
 // @namespace    http://tampermonkey.net/
-// @version      1.1.2
+// @version      1.1.3
 // @description  Lazy-loads videos, tries cancelable GM blob loading for Twitter/X, Instagram, and Facebook, auto-cleans old blobs, and falls back to embeds
 // @author       hanenashi
 // @match        *://*.okoun.cz/*
@@ -61,13 +61,10 @@
     }
 
     function gmRequest(details) {
-        if (typeof GM_xmlhttpRequest === 'function') {
-            return GM_xmlhttpRequest(details);
-        }
+        if (typeof GM_xmlhttpRequest === 'function') return GM_xmlhttpRequest(details);
 
         if (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function') {
             const result = GM.xmlHttpRequest(details);
-
             if (result && typeof result.then === 'function') {
                 result.then((res) => {
                     if (typeof details.onload === 'function') details.onload(res);
@@ -75,7 +72,6 @@
                     if (typeof details.onerror === 'function') details.onerror(err);
                 });
             }
-
             return result;
         }
 
@@ -90,15 +86,9 @@
                 timeout,
                 headers: { 'Accept': 'application/json,text/plain,*/*' },
                 onload: (res) => {
-                    if (res.status < 200 || res.status >= 300) {
-                        reject(new Error(`HTTP ${res.status}`));
-                        return;
-                    }
-                    try {
-                        resolve(JSON.parse(res.responseText));
-                    } catch (e) {
-                        reject(new Error('Bad JSON response'));
-                    }
+                    if (res.status < 200 || res.status >= 300) return reject(new Error(`HTTP ${res.status}`));
+                    try { resolve(JSON.parse(res.responseText)); }
+                    catch (e) { reject(new Error('Bad JSON response')); }
                 },
                 onerror: () => reject(new Error('GM JSON request failed')),
                 ontimeout: () => reject(new Error('GM JSON request timeout'))
@@ -117,10 +107,7 @@
                     'Referer': referer || url
                 },
                 onload: (res) => {
-                    if (res.status < 200 || res.status >= 300) {
-                        reject(new Error(`HTML HTTP ${res.status}`));
-                        return;
-                    }
+                    if (res.status < 200 || res.status >= 300) return reject(new Error(`HTML HTTP ${res.status}`));
                     resolve(res.responseText || '');
                 },
                 onerror: () => reject(new Error('GM HTML request failed')),
@@ -153,7 +140,6 @@
                     },
                     onprogress: (ev) => {
                         if (aborted || settled) return;
-
                         const loaded = ev && Number.isFinite(ev.loaded) ? ev.loaded : 0;
                         const total = ev && ev.lengthComputable && Number.isFinite(ev.total) ? ev.total : 0;
 
@@ -168,37 +154,23 @@
                     },
                     onload: (res) => {
                         if (aborted || settled) return;
-
-                        if (res.status < 200 || res.status >= 300) {
-                            fail(new Error(`MP4 HTTP ${res.status}`));
-                            return;
-                        }
+                        if (res.status < 200 || res.status >= 300) return fail(new Error(`MP4 HTTP ${res.status}`));
 
                         const contentLength = Number(getResponseHeader(res.responseHeaders, 'content-length'));
                         if (Number.isFinite(contentLength) && contentLength > MAX_BLOB_BYTES) {
-                            fail(new Error(`Video too large for safe blob load (${formatBytes(contentLength)})`));
-                            return;
+                            return fail(new Error(`Video too large for safe blob load (${formatBytes(contentLength)})`));
                         }
 
-                        if (!res.response || !res.response.size) {
-                            fail(new Error('Empty MP4 blob'));
-                            return;
-                        }
-
+                        if (!res.response || !res.response.size) return fail(new Error('Empty MP4 blob'));
                         if (res.response.size > MAX_BLOB_BYTES) {
-                            fail(new Error(`Video too large for safe blob load (${formatBytes(res.response.size)})`));
-                            return;
+                            return fail(new Error(`Video too large for safe blob load (${formatBytes(res.response.size)})`));
                         }
 
                         settled = true;
                         resolve(URL.createObjectURL(res.response));
                     },
-                    onerror: () => {
-                        if (!aborted) fail(new Error('GM MP4 request failed'));
-                    },
-                    ontimeout: () => {
-                        if (!aborted) fail(new Error('GM MP4 request timeout'));
-                    }
+                    onerror: () => { if (!aborted) fail(new Error('GM MP4 request failed')); },
+                    ontimeout: () => { if (!aborted) fail(new Error('GM MP4 request timeout')); }
                 });
             } catch (e) {
                 fail(e);
@@ -224,7 +196,6 @@
     function looseDecodeUrl(str) {
         if (!str) return '';
         let out = String(str);
-
         for (let i = 0; i < 3; i++) {
             out = htmlDecode(out)
                 .replace(/\\\//g, '/')
@@ -234,10 +205,8 @@
                 .replace(/\\u003f/gi, '?')
                 .replace(/\\u002f/gi, '/')
                 .replace(/\\u003a/gi, ':');
-
             try { out = decodeURIComponent(out); } catch (e) { /* keep partial */ }
         }
-
         return out;
     }
 
@@ -247,7 +216,6 @@
 
     function extractFirstMp4FromHtml(html) {
         if (!html) return null;
-
         const patterns = [
             /<meta[^>]+(?:property|name)=["']og:video(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i,
             /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:video(?::secure_url)?["']/i,
@@ -270,7 +238,6 @@
             const decoded = looseDecodeUrl(match[1]);
             if (looksLikeMp4Url(decoded)) return decoded;
         }
-
         return null;
     }
 
@@ -304,12 +271,12 @@
         return iframe;
     }
 
-    function makeDownloadPanel(serviceName, originalUrl) {
+    function makeDownloadPanel(service, originalUrl) {
         const panel = document.createElement('div');
         panel.setAttribute('data-vidokoun-node', '1');
         panel.style.cssText = [
             'width: 100%;',
-            'min-height: 110px;',
+            service.style || 'aspect-ratio: 16/9;',
             'background: #1a1a1a;',
             'color: #ddd;',
             'border-radius: 4px;',
@@ -325,10 +292,10 @@
         ].join(' ');
 
         const box = document.createElement('div');
-        box.style.cssText = 'display: flex; flex-direction: column; gap: 8px; align-items: center;';
+        box.style.cssText = 'display: flex; flex-direction: column; gap: 8px; align-items: center; max-width: 95%;';
 
         const status = document.createElement('div');
-        status.textContent = `Loading ${serviceName}...`;
+        status.textContent = `Loading ${service.name}...`;
 
         const hint = document.createElement('div');
         hint.style.cssText = 'font-size: 11px; color: #aaa;';
@@ -390,25 +357,20 @@
     }
 
     async function insertBlobVideo({ placeholderNode, match, originalUrl, service, videoUrl, referer, fallbackNodeFactory }) {
-        const loading = makeDownloadPanel(service.name, originalUrl);
+        const loading = makeDownloadPanel(service, originalUrl);
         placeholderNode.replaceWith(loading.panel);
 
         let cancelled = false;
         let blobUrl = null;
         const download = gmGetBlobUrlAbortable(videoUrl, referer, BLOB_DOWNLOAD_TIMEOUT, ({ loaded, total }) => {
-            if (total > 0) {
-                loading.setStatus(`Downloading ${service.name}... ${formatBytes(loaded)} / ${formatBytes(total)}`);
-            } else if (loaded > 0) {
-                loading.setStatus(`Downloading ${service.name}... ${formatBytes(loaded)}`);
-            }
+            if (total > 0) loading.setStatus(`Downloading ${service.name}... ${formatBytes(loaded)} / ${formatBytes(total)}`);
+            else if (loaded > 0) loading.setStatus(`Downloading ${service.name}... ${formatBytes(loaded)}`);
         });
 
         loading.setCancel(() => {
             cancelled = true;
             download.abort();
-            if (loading.panel.isConnected) {
-                loading.panel.replaceWith(createPlaceholder(service, match, originalUrl));
-            }
+            if (loading.panel.isConnected) loading.panel.replaceWith(createPlaceholder(service, match, originalUrl));
         });
 
         try {
@@ -418,9 +380,7 @@
             if (cancelled) return;
             loading.setStatus(`${service.name} blob load failed. Opening fallback...`);
             loading.disableCancel();
-            if (loading.panel.isConnected && fallbackNodeFactory) {
-                loading.panel.replaceWith(fallbackNodeFactory());
-            }
+            if (loading.panel.isConnected && fallbackNodeFactory) loading.panel.replaceWith(fallbackNodeFactory());
             return;
         }
 
@@ -456,17 +416,13 @@
                 try { video.load(); } catch (e) { /* ignore */ }
                 URL.revokeObjectURL(blobUrl);
                 unregisterSocialBlobVideo(record);
-                if (!pageLeaving && video.isConnected) {
-                    video.replaceWith(createPlaceholder(service, match, originalUrl));
-                }
+                if (!pageLeaving && video.isConnected) video.replaceWith(createPlaceholder(service, match, originalUrl));
             }
         };
 
         video.addEventListener('error', () => {
             record.unload(true);
-            if (video.isConnected && fallbackNodeFactory) {
-                video.replaceWith(fallbackNodeFactory());
-            }
+            if (video.isConnected && fallbackNodeFactory) video.replaceWith(fallbackNodeFactory());
         }, { once: true });
 
         if (loading.panel.isConnected) {
@@ -499,9 +455,7 @@
                 const id = match[2];
                 try {
                     const data = await gmGetJson(`https://api.vxtwitter.com/${encodeURIComponent(username)}/status/${encodeURIComponent(id)}`);
-                    const videoUrl =
-                        (data.mediaURLs || []).find(url => /\.mp4(?:\?|$)/i.test(url)) ||
-                        (data.media_extended || []).map(m => m.url).find(url => /\.mp4(?:\?|$)/i.test(url));
+                    const videoUrl = (data.mediaURLs || []).find(url => /\.mp4(?:\?|$)/i.test(url)) || (data.media_extended || []).map(m => m.url).find(url => /\.mp4(?:\?|$)/i.test(url));
                     if (!videoUrl) throw new Error('No MP4 found in tweet');
                     await insertBlobVideo({ placeholderNode, match, originalUrl, service, videoUrl, referer: 'https://x.com/', fallbackNodeFactory: () => makeTwitterIframe(id) });
                 } catch (e) {
