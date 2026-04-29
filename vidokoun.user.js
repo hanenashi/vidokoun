@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         vidokoun
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
+// @version      1.2.1
 // @description  Lazy-loads videos, tries cancelable GM blob loading for Twitter/X, Instagram, Facebook, and Telegram, auto-cleans old blobs, and falls back to embeds
 // @author       hanenashi
 // @match        *://*.okoun.cz/*
@@ -9,6 +9,8 @@
 // @downloadURL  https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
+// @grant        GM_registerMenuCommand
+// @grant        GM.registerMenuCommand
 // @connect      api.vxtwitter.com
 // @connect      video.twimg.com
 // @connect      twitter.com
@@ -35,7 +37,7 @@
     'use strict';
 
     const DEBUG = false;
-    const APP_VERSION = '1.2.0';
+    const APP_VERSION = '1.2.1';
     const GITHUB_URL = 'https://github.com/hanenashi/vidokoun';
     const SETTINGS_KEY = 'vidokoun.settings.v1';
     const MAX_WIDTH = '550px';
@@ -92,6 +94,7 @@
     function loadSettings() {
         try {
             const raw = localStorage.getItem(SETTINGS_KEY);
+
             if (!raw) {
                 return {
                     ...DEFAULT_SETTINGS,
@@ -183,6 +186,18 @@
         }
 
         throw new Error('No GM xmlhttp request API available');
+    }
+
+    function gmMenuCommand(label, callback) {
+        if (typeof GM_registerMenuCommand === 'function') {
+            return GM_registerMenuCommand(label, callback);
+        }
+
+        if (typeof GM !== 'undefined' && GM && typeof GM.registerMenuCommand === 'function') {
+            return GM.registerMenuCommand(label, callback);
+        }
+
+        return null;
     }
 
     function gmGetJson(url, timeout = 12000) {
@@ -364,6 +379,7 @@
 
     function absoluteUrl(url, baseUrl) {
         if (!url) return '';
+
         let out = htmlDecode(String(url)).trim();
 
         if (out.startsWith('//')) {
@@ -516,8 +532,12 @@
 
         return {
             panel,
-            setStatus: (text) => { status.textContent = text; },
-            setCancel: (fn) => { cancel.onclick = fn; },
+            setStatus: (text) => {
+                status.textContent = text;
+            },
+            setCancel: (fn) => {
+                cancel.onclick = fn;
+            },
             disableCancel: () => {
                 cancel.disabled = true;
                 cancel.style.opacity = '0.5';
@@ -549,6 +569,22 @@
 
         menu.style.left = `${left}px`;
         menu.style.top = `${top}px`;
+    }
+
+    function openVidokounSettingsFromMenu() {
+        closeSettingsMenus();
+
+        const menu = makeSettingsMenu();
+        menu.dataset.ownerButton = 'userscript-menu';
+
+        document.body.appendChild(menu);
+
+        const margin = 10;
+        const width = Math.min(300, Math.max(260, window.innerWidth - margin * 2));
+
+        menu.style.width = `${width}px`;
+        menu.style.left = `${Math.max(margin, window.innerWidth - width - margin)}px`;
+        menu.style.top = `${margin}px`;
     }
 
     function makeSettingsButton() {
@@ -636,8 +672,21 @@
         title.style.cssText = 'font-weight:bold;margin-bottom:8px;';
         menu.appendChild(title);
 
-        menu.appendChild(makeSelectRow('Blob size limit', 'maxBlobMb', [0, 25, 50, 80, 120, 200], 'MB', () => {}));
-        menu.appendChild(makeSelectRow('Loaded blob videos', 'maxLoadedBlobs', [1, 2, 3, 5], '', cleanupSocialBlobs));
+        menu.appendChild(makeSelectRow(
+            'Blob size limit',
+            'maxBlobMb',
+            [0, 25, 50, 80, 120, 200],
+            'MB',
+            () => {}
+        ));
+
+        menu.appendChild(makeSelectRow(
+            'Loaded blob videos',
+            'maxLoadedBlobs',
+            [1, 2, 3, 5],
+            '',
+            cleanupSocialBlobs
+        ));
 
         const servicesTitle = document.createElement('div');
         servicesTitle.textContent = 'Enabled services';
@@ -778,6 +827,7 @@
     function cleanupSocialBlobs() {
         while (loadedSocialBlobs.length > settings.maxLoadedBlobs) {
             const oldest = loadedSocialBlobs.shift();
+
             if (oldest && typeof oldest.unload === 'function') {
                 oldest.unload();
             }
@@ -787,6 +837,7 @@
     function revokeAllSocialBlobs() {
         while (loadedSocialBlobs.length) {
             const item = loadedSocialBlobs.shift();
+
             if (item && typeof item.unload === 'function') {
                 item.unload(true);
             }
@@ -1262,6 +1313,8 @@
             roots.forEach(processRoot);
         }, 250);
     }
+
+    gmMenuCommand('vidokoun settings', openVidokounSettingsFromMenu);
 
     processRoot(document.body);
 
