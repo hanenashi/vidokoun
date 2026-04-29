@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         vidokoun
 // @namespace    http://tampermonkey.net/
-// @version      1.1.5
-// @description  Lazy-loads videos, tries cancelable GM blob loading for Twitter/X, Instagram, and Facebook, auto-cleans old blobs, and falls back to embeds
+// @version      1.2.0
+// @description  Lazy-loads videos, tries cancelable GM blob loading for Twitter/X, Instagram, Facebook, and Telegram, auto-cleans old blobs, and falls back to embeds
 // @author       hanenashi
 // @match        *://*.okoun.cz/*
 // @updateURL    https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js
@@ -24,21 +24,41 @@
 // @connect      *.xx.fbcdn.net
 // @connect      fbsbx.com
 // @connect      *.fbsbx.com
+// @connect      t.me
+// @connect      telegram.me
+// @connect      *.t.me
+// @connect      cdn-telegram.org
+// @connect      *.cdn-telegram.org
 // ==/UserScript==
 
 (function() {
     'use strict';
 
     const DEBUG = false;
-    const APP_VERSION = '1.1.5';
+    const APP_VERSION = '1.2.0';
     const GITHUB_URL = 'https://github.com/hanenashi/vidokoun';
     const SETTINGS_KEY = 'vidokoun.settings.v1';
     const MAX_WIDTH = '550px';
     const BLOB_DOWNLOAD_TIMEOUT = 30000;
 
+    const SERVICE_OPTIONS = [
+        { key: 'youtube', label: 'YouTube' },
+        { key: 'vimeo', label: 'Vimeo' },
+        { key: 'twitter', label: 'Twitter/X' },
+        { key: 'instagram', label: 'Instagram' },
+        { key: 'facebook', label: 'Facebook' },
+        { key: 'telegram', label: 'Telegram' },
+        { key: 'directMp4', label: 'Direct MP4' }
+    ];
+
+    const DEFAULT_ENABLED_SERVICES = Object.fromEntries(
+        SERVICE_OPTIONS.map(service => [service.key, true])
+    );
+
     const DEFAULT_SETTINGS = {
         maxBlobMb: 80,       // 0 means no limit
-        maxLoadedBlobs: 3
+        maxLoadedBlobs: 3,
+        enabledServices: { ...DEFAULT_ENABLED_SERVICES }
     };
 
     let settings = loadSettings();
@@ -53,10 +73,31 @@
         return allowed.includes(n) ? n : fallback;
     }
 
+    function sanitizeEnabledServices(input) {
+        const result = { ...DEFAULT_ENABLED_SERVICES };
+
+        if (!input || typeof input !== 'object') {
+            return result;
+        }
+
+        for (const service of SERVICE_OPTIONS) {
+            if (typeof input[service.key] === 'boolean') {
+                result[service.key] = input[service.key];
+            }
+        }
+
+        return result;
+    }
+
     function loadSettings() {
         try {
             const raw = localStorage.getItem(SETTINGS_KEY);
-            if (!raw) return { ...DEFAULT_SETTINGS };
+            if (!raw) {
+                return {
+                    ...DEFAULT_SETTINGS,
+                    enabledServices: { ...DEFAULT_ENABLED_SERVICES }
+                };
+            }
 
             const parsed = JSON.parse(raw);
 
@@ -70,10 +111,14 @@
                     parsed.maxLoadedBlobs,
                     [1, 2, 3, 5],
                     DEFAULT_SETTINGS.maxLoadedBlobs
-                )
+                ),
+                enabledServices: sanitizeEnabledServices(parsed.enabledServices)
             };
         } catch (e) {
-            return { ...DEFAULT_SETTINGS };
+            return {
+                ...DEFAULT_SETTINGS,
+                enabledServices: { ...DEFAULT_ENABLED_SERVICES }
+            };
         }
     }
 
@@ -83,6 +128,10 @@
         } catch (e) {
             // ignore
         }
+    }
+
+    function isServiceEnabled(key) {
+        return !key || settings.enabledServices[key] !== false;
     }
 
     function maxBlobBytes() {
@@ -313,14 +362,38 @@
         return out;
     }
 
-    function looksLikeMp4Url(url) {
-        return /^https?:\/\//i.test(url || '') && /\.mp4(?:[?#]|$)/i.test(url || '');
+    function absoluteUrl(url, baseUrl) {
+        if (!url) return '';
+        let out = htmlDecode(String(url)).trim();
+
+        if (out.startsWith('//')) {
+            out = 'https:' + out;
+        } else if (out.startsWith('/')) {
+            try {
+                out = new URL(out, baseUrl || location.href).href;
+            } catch (e) {
+                // keep original
+            }
+        }
+
+        return out;
     }
 
-    function extractFirstMp4FromHtml(html) {
+    function looksLikeMp4Url(url) {
+        return /^https?:\/\//i.test(url || '') && (
+            /\.mp4(?:[?#]|$)/i.test(url || '') ||
+            /cdn-telegram\.org\/file\//i.test(url || '')
+        );
+    }
+
+    function extractFirstMp4FromHtml(html, baseUrl) {
         if (!html) return null;
 
         const patterns = [
+            /<video[^>]+src=["']([^"']+)["']/i,
+            /<source[^>]+src=["']([^"']+)["']/i,
+            /data-video=["']([^"']+)["']/i,
+            /data-video-url=["']([^"']+)["']/i,
             /<meta[^>]+(?:property|name)=["']og:video(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i,
             /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:video(?::secure_url)?["']/i,
             /<meta[^>]+(?:property|name)=["']twitter:player:stream["'][^>]+content=["']([^"']+)["']/i,
@@ -333,14 +406,16 @@
             /"contentUrl"\s*:\s*"([^"]+)"/i,
             /"src"\s*:\s*"(https?:\\\/\\\/[^"<>]+?\.mp4[^"<>]*)"/i,
             /(https?:\\\/\\\/[^"<>]+?\.mp4[^"<>]*)/i,
-            /(https?:\/\/[^"'<>\s]+?\.mp4[^"'<>\s]*)/i
+            /(https?:\/\/[^"'<>\s]+?\.mp4[^"'<>\s]*)/i,
+            /(https?:\\\/\\\/[^"<>]+?cdn-telegram\.org\\\/file\\\/[^"<>]+)/i,
+            /(https?:\/\/[^"'<>\s]+?cdn-telegram\.org\/file\/[^"'<>\s]+)/i
         ];
 
         for (const pattern of patterns) {
             const match = html.match(pattern);
             if (!match || !match[1]) continue;
 
-            const decoded = looseDecodeUrl(match[1]);
+            const decoded = absoluteUrl(looseDecodeUrl(match[1]), baseUrl);
             if (looksLikeMp4Url(decoded)) return decoded;
         }
 
@@ -351,14 +426,7 @@
         const iframe = document.createElement('iframe');
         iframe.setAttribute('data-vidokoun-node', '1');
         iframe.src = `https://platform.twitter.com/embed/Tweet.html?id=${encodeURIComponent(id)}`;
-        iframe.style.cssText = [
-            'width: 100%;',
-            'height: 460px;',
-            'resize: vertical;',
-            'border: none;',
-            'border-radius: 4px;',
-            'background: #fff;'
-        ].join(' ');
+        iframe.style.cssText = 'width:100%;height:460px;resize:vertical;border:none;border-radius:4px;background:#fff;';
         iframe.allowFullscreen = true;
         iframe.allow = 'autoplay; fullscreen; picture-in-picture';
         return iframe;
@@ -368,14 +436,7 @@
         const iframe = document.createElement('iframe');
         iframe.setAttribute('data-vidokoun-node', '1');
         iframe.src = `https://www.instagram.com/${type}/${encodeURIComponent(shortcode)}/embed/`;
-        iframe.style.cssText = [
-            'width: 100%;',
-            'height: 560px;',
-            'resize: vertical;',
-            'border: none;',
-            'border-radius: 4px;',
-            'background: #fff;'
-        ].join(' ');
+        iframe.style.cssText = 'width:100%;height:560px;resize:vertical;border:none;border-radius:4px;background:#fff;';
         iframe.allowFullscreen = true;
         iframe.allow = 'autoplay; fullscreen; picture-in-picture';
         return iframe;
@@ -385,16 +446,19 @@
         const iframe = document.createElement('iframe');
         iframe.setAttribute('data-vidokoun-node', '1');
         iframe.src = `https://www.facebook.com/plugins/video.php?href=${encodeURIComponent(originalUrl)}&show_text=false&width=550`;
-        iframe.style.cssText = [
-            'width: 100%;',
-            'height: 460px;',
-            'resize: vertical;',
-            'border: none;',
-            'border-radius: 4px;',
-            'background: #fff;'
-        ].join(' ');
+        iframe.style.cssText = 'width:100%;height:460px;resize:vertical;border:none;border-radius:4px;background:#fff;';
         iframe.allowFullscreen = true;
         iframe.allow = 'autoplay; encrypted-media; fullscreen; picture-in-picture';
+        return iframe;
+    }
+
+    function makeTelegramIframe(channel, postId) {
+        const iframe = document.createElement('iframe');
+        iframe.setAttribute('data-vidokoun-node', '1');
+        iframe.src = `https://t.me/${encodeURIComponent(channel)}/${encodeURIComponent(postId)}?embed=1&mode=tme`;
+        iframe.style.cssText = 'width:100%;height:460px;resize:vertical;border:none;border-radius:4px;background:#fff;';
+        iframe.allowFullscreen = true;
+        iframe.allow = 'autoplay; fullscreen; picture-in-picture';
         return iframe;
     }
 
@@ -402,54 +466,46 @@
         const panel = document.createElement('div');
         panel.setAttribute('data-vidokoun-node', '1');
         panel.style.cssText = [
-            'width: 100%;',
-            service.style || 'aspect-ratio: 16/9;',
-            'background: #1a1a1a;',
-            'color: #ddd;',
-            'border-radius: 4px;',
-            'display: flex;',
-            'align-items: center;',
-            'justify-content: center;',
-            'font-family: sans-serif;',
-            'font-size: 13px;',
-            'text-align: center;',
-            'padding: 12px;',
-            'box-sizing: border-box;',
-            'box-shadow: 0 2px 8px rgba(0,0,0,0.2);'
-        ].join(' ');
+            'width:100%;',
+            service.style || 'aspect-ratio:16/9;',
+            'background:#1a1a1a;',
+            'color:#ddd;',
+            'border-radius:4px;',
+            'display:flex;',
+            'align-items:center;',
+            'justify-content:center;',
+            'font-family:sans-serif;',
+            'font-size:13px;',
+            'text-align:center;',
+            'padding:12px;',
+            'box-sizing:border-box;',
+            'box-shadow:0 2px 8px rgba(0,0,0,0.2);'
+        ].join('');
 
         const box = document.createElement('div');
-        box.style.cssText = 'display: flex; flex-direction: column; gap: 8px; align-items: center; max-width: 95%;';
+        box.style.cssText = 'display:flex;flex-direction:column;gap:8px;align-items:center;max-width:95%;';
 
         const status = document.createElement('div');
         status.textContent = `Loading ${service.name}...`;
 
         const hint = document.createElement('div');
-        hint.style.cssText = 'font-size: 11px; color: #aaa;';
+        hint.style.cssText = 'font-size:11px;color:#aaa;';
         hint.textContent = `Safe limit: ${formatBytes(maxBlobBytes())}`;
 
         const row = document.createElement('div');
-        row.style.cssText = 'display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;';
+        row.style.cssText = 'display:flex;gap:8px;justify-content:center;flex-wrap:wrap;';
 
         const cancel = document.createElement('button');
         cancel.type = 'button';
         cancel.textContent = 'Cancel';
-        cancel.style.cssText = [
-            'font-size: 12px;',
-            'padding: 5px 12px;',
-            'cursor: pointer;',
-            'border-radius: 4px;',
-            'border: 1px solid #777;',
-            'background: #333;',
-            'color: #eee;'
-        ].join(' ');
+        cancel.style.cssText = 'font-size:12px;padding:5px 12px;cursor:pointer;border-radius:4px;border:1px solid #777;background:#333;color:#eee;';
 
         const original = document.createElement('a');
         original.href = originalUrl;
         original.target = '_blank';
         original.rel = 'noopener noreferrer';
         original.textContent = 'Open original';
-        original.style.cssText = 'font-size: 12px; color: #aaa; align-self: center;';
+        original.style.cssText = 'font-size:12px;color:#aaa;align-self:center;';
 
         row.appendChild(cancel);
         row.appendChild(original);
@@ -460,15 +516,8 @@
 
         return {
             panel,
-            setStatus: (text) => {
-                status.textContent = text;
-            },
-            setHint: (text) => {
-                hint.textContent = text;
-            },
-            setCancel: (fn) => {
-                cancel.onclick = fn;
-            },
+            setStatus: (text) => { status.textContent = text; },
+            setCancel: (fn) => { cancel.onclick = fn; },
             disableCancel: () => {
                 cancel.disabled = true;
                 cancel.style.opacity = '0.5';
@@ -484,7 +533,7 @@
     function positionSettingsMenu(menu, button) {
         const rect = button.getBoundingClientRect();
         const margin = 8;
-        const width = Math.min(270, Math.max(230, window.innerWidth - margin * 2));
+        const width = Math.min(300, Math.max(260, window.innerWidth - margin * 2));
 
         menu.style.width = `${width}px`;
 
@@ -492,7 +541,7 @@
         left = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
 
         let top = rect.bottom + margin;
-        const approxHeight = 235;
+        const approxHeight = 440;
 
         if (top + approxHeight > window.innerHeight) {
             top = Math.max(margin, rect.top - approxHeight - margin);
@@ -511,21 +560,21 @@
         btn.dataset.vidokounMenuOwner = `${Date.now()}-${Math.random()}`;
 
         btn.style.cssText = [
-            'position: absolute;',
-            'top: 6px;',
-            'right: 6px;',
-            'z-index: 5;',
-            'font-family: sans-serif;',
-            'font-size: 10px;',
-            'line-height: 1;',
-            'padding: 4px 6px;',
-            'border-radius: 999px;',
-            'border: 1px solid rgba(255,255,255,0.25);',
-            'background: rgba(0,0,0,0.62);',
-            'color: #ddd;',
-            'cursor: pointer;',
-            'opacity: 0.72;'
-        ].join(' ');
+            'position:absolute;',
+            'top:6px;',
+            'right:6px;',
+            'z-index:5;',
+            'font-family:sans-serif;',
+            'font-size:10px;',
+            'line-height:1;',
+            'padding:4px 6px;',
+            'border-radius:999px;',
+            'border:1px solid rgba(255,255,255,0.25);',
+            'background:rgba(0,0,0,0.62);',
+            'color:#ddd;',
+            'cursor:pointer;',
+            'opacity:0.72;'
+        ].join('');
 
         btn.addEventListener('click', (ev) => {
             ev.preventDefault();
@@ -552,15 +601,7 @@
         const button = document.createElement('button');
         button.type = 'button';
         button.textContent = text;
-        button.style.cssText = [
-            'font-size: 11px;',
-            'padding: 3px 7px;',
-            'border-radius: 4px;',
-            'border: 1px solid #666;',
-            'background: #2b2b2b;',
-            'color: #ddd;',
-            'cursor: pointer;'
-        ].join(' ');
+        button.style.cssText = 'font-size:11px;padding:3px 7px;border-radius:4px;border:1px solid #666;background:#2b2b2b;color:#ddd;cursor:pointer;';
         return button;
     }
 
@@ -570,62 +611,64 @@
         menu.setAttribute('data-vidokoun-node', '1');
 
         menu.style.cssText = [
-            'position: fixed;',
-            'z-index: 2147483647;',
-            'background: rgba(18,18,18,0.97);',
-            'color: #eee;',
-            'border: 1px solid rgba(255,255,255,0.22);',
-            'border-radius: 8px;',
-            'box-shadow: 0 4px 18px rgba(0,0,0,0.45);',
-            'font-family: sans-serif;',
-            'font-size: 12px;',
-            'text-align: left;',
-            'padding: 10px;',
-            'box-sizing: border-box;',
-            'cursor: default;',
-            'line-height: 1.3;'
-        ].join(' ');
+            'position:fixed;',
+            'z-index:2147483647;',
+            'max-height:calc(100vh - 16px);',
+            'overflow:auto;',
+            'background:rgba(18,18,18,0.97);',
+            'color:#eee;',
+            'border:1px solid rgba(255,255,255,0.22);',
+            'border-radius:8px;',
+            'box-shadow:0 4px 18px rgba(0,0,0,0.45);',
+            'font-family:sans-serif;',
+            'font-size:12px;',
+            'text-align:left;',
+            'padding:10px;',
+            'box-sizing:border-box;',
+            'cursor:default;',
+            'line-height:1.3;'
+        ].join('');
 
         menu.addEventListener('click', (ev) => ev.stopPropagation());
 
         const title = document.createElement('div');
         title.textContent = `vidokoun ${APP_VERSION}`;
-        title.style.cssText = 'font-weight: bold; margin-bottom: 8px;';
+        title.style.cssText = 'font-weight:bold;margin-bottom:8px;';
         menu.appendChild(title);
 
-        menu.appendChild(makeSelectRow(
-            'Blob size limit',
-            'maxBlobMb',
-            [0, 25, 50, 80, 120, 200],
-            'MB',
-            () => {}
-        ));
+        menu.appendChild(makeSelectRow('Blob size limit', 'maxBlobMb', [0, 25, 50, 80, 120, 200], 'MB', () => {}));
+        menu.appendChild(makeSelectRow('Loaded blob videos', 'maxLoadedBlobs', [1, 2, 3, 5], '', cleanupSocialBlobs));
 
-        menu.appendChild(makeSelectRow(
-            'Loaded blob videos',
-            'maxLoadedBlobs',
-            [1, 2, 3, 5],
-            '',
-            cleanupSocialBlobs
-        ));
+        const servicesTitle = document.createElement('div');
+        servicesTitle.textContent = 'Enabled services';
+        servicesTitle.style.cssText = 'font-weight:bold;margin:10px 0 5px;';
+        menu.appendChild(servicesTitle);
+
+        SERVICE_OPTIONS.forEach(service => {
+            menu.appendChild(makeServiceCheckboxRow(service));
+        });
 
         const links = document.createElement('div');
-        links.style.cssText = 'display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px;';
+        links.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px;';
 
         const github = document.createElement('a');
         github.href = GITHUB_URL;
         github.target = '_blank';
         github.rel = 'noopener noreferrer';
         github.textContent = 'GitHub';
-        github.style.cssText = 'color: #aaa;';
+        github.style.cssText = 'color:#aaa;';
 
         const reset = makeSmallButton('Reset');
         reset.onclick = (ev) => {
             ev.stopPropagation();
-            settings = { ...DEFAULT_SETTINGS };
+            settings = {
+                ...DEFAULT_SETTINGS,
+                enabledServices: { ...DEFAULT_ENABLED_SERVICES }
+            };
             saveSettings();
             cleanupSocialBlobs();
             closeSettingsMenus();
+            processRoot(document.body);
         };
 
         const close = makeSmallButton('Close');
@@ -641,7 +684,7 @@
 
         const note = document.createElement('div');
         note.textContent = 'Settings are saved in this browser only.';
-        note.style.cssText = 'font-size: 10px; color: #888; margin-top: 8px;';
+        note.style.cssText = 'font-size:10px;color:#888;margin-top:8px;';
         menu.appendChild(note);
 
         return menu;
@@ -649,26 +692,14 @@
 
     function makeSelectRow(labelText, settingName, values, suffix, afterChange) {
         const row = document.createElement('label');
-        row.style.cssText = [
-            'display: flex;',
-            'align-items: center;',
-            'justify-content: space-between;',
-            'gap: 8px;',
-            'margin: 7px 0;'
-        ].join(' ');
+        row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;margin:7px 0;';
 
         const label = document.createElement('span');
         label.textContent = labelText;
-        label.style.cssText = 'color: #ccc;';
+        label.style.cssText = 'color:#ccc;';
 
         const select = document.createElement('select');
-        select.style.cssText = [
-            'background: #222;',
-            'color: #eee;',
-            'border: 1px solid #666;',
-            'border-radius: 4px;',
-            'padding: 2px 4px;'
-        ].join(' ');
+        select.style.cssText = 'background:#222;color:#eee;border:1px solid #666;border-radius:4px;padding:2px 4px;';
 
         values.forEach(value => {
             const option = document.createElement('option');
@@ -695,6 +726,33 @@
 
         row.appendChild(label);
         row.appendChild(select);
+        return row;
+    }
+
+    function makeServiceCheckboxRow(service) {
+        const row = document.createElement('label');
+        row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;margin:5px 0;color:#ccc;';
+
+        const label = document.createElement('span');
+        label.textContent = service.label;
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = isServiceEnabled(service.key);
+        checkbox.style.cssText = 'transform:scale(1.05);';
+
+        checkbox.onchange = () => {
+            settings.enabledServices[service.key] = checkbox.checked;
+            saveSettings();
+
+            if (checkbox.checked) {
+                processRoot(document.body);
+            }
+        };
+
+        row.appendChild(label);
+        row.appendChild(checkbox);
+
         return row;
     }
 
@@ -789,12 +847,12 @@
         video.playsInline = true;
         video.setAttribute('data-vidokoun-node', '1');
         video.style.cssText = [
-            'width: 100%;',
-            service.style || 'aspect-ratio: 16/9;',
-            'border-radius: 4px;',
-            'box-shadow: 0 2px 8px rgba(0,0,0,0.2);',
-            'background: #000;'
-        ].join(' ');
+            'width:100%;',
+            service.style || 'aspect-ratio:16/9;',
+            'border-radius:4px;',
+            'box-shadow:0 2px 8px rgba(0,0,0,0.2);',
+            'background:#000;'
+        ].join('');
 
         let unloaded = false;
 
@@ -846,21 +904,24 @@
 
     const services = [
         {
+            key: 'youtube',
             name: 'YouTube',
             regex: /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/|youtube\.com\/shorts\/)([^"&?\/\s]{11})/i,
             getEmbedUrl: (id) => `https://www.youtube.com/embed/${id}?autoplay=1`,
-            style: 'aspect-ratio: 16/9;'
+            style: 'aspect-ratio:16/9;'
         },
         {
+            key: 'vimeo',
             name: 'Vimeo',
             regex: /vimeo\.com\/(?:.*#|.*\/videos\/)?([0-9]+)/i,
             getEmbedUrl: (id) => `https://player.vimeo.com/video/${id}?autoplay=1`,
-            style: 'aspect-ratio: 16/9;'
+            style: 'aspect-ratio:16/9;'
         },
         {
+            key: 'twitter',
             name: 'Twitter/X',
             regex: /(?:twitter\.com|x\.com)\/([a-zA-Z0-9_]+)\/status\/(\d+)/i,
-            style: 'aspect-ratio: 16/9; background: #000;',
+            style: 'aspect-ratio:16/9;background:#000;',
             customAction: async (placeholderNode, match, originalUrl, service) => {
                 const username = match[1];
                 const id = match[2];
@@ -872,9 +933,7 @@
                         (data.mediaURLs || []).find(url => /\.mp4(?:\?|$)/i.test(url)) ||
                         (data.media_extended || []).map(m => m.url).find(url => /\.mp4(?:\?|$)/i.test(url));
 
-                    if (!videoUrl) {
-                        throw new Error('No MP4 found in tweet');
-                    }
+                    if (!videoUrl) throw new Error('No MP4 found in tweet');
 
                     await insertBlobVideo({
                         placeholderNode,
@@ -892,20 +951,19 @@
             }
         },
         {
+            key: 'instagram',
             name: 'Instagram',
             regex: /instagram\.com\/(p|reel)\/([a-zA-Z0-9_-]+)/i,
-            style: 'aspect-ratio: 4/5; min-height: 550px; background: #000;',
+            style: 'aspect-ratio:4/5;min-height:550px;background:#000;',
             customAction: async (placeholderNode, match, originalUrl, service) => {
                 const type = match[1];
                 const shortcode = match[2];
 
                 try {
                     const html = await gmGetText(originalUrl, 'https://www.instagram.com/');
-                    const videoUrl = extractFirstMp4FromHtml(html);
+                    const videoUrl = extractFirstMp4FromHtml(html, originalUrl);
 
-                    if (!videoUrl) {
-                        throw new Error('No MP4 found in Instagram page');
-                    }
+                    if (!videoUrl) throw new Error('No MP4 found in Instagram page');
 
                     await insertBlobVideo({
                         placeholderNode,
@@ -923,17 +981,16 @@
             }
         },
         {
+            key: 'facebook',
             name: 'Facebook',
             regex: /facebook\.com\/(?:watch\/?\?v=\d+|reel\/[^/?#]+|[^\s?#]+\/videos\/[^/?#]+|share\/v\/[^/?#]+|[^\s?#]+\/posts\/[^/?#]+)/i,
-            style: 'aspect-ratio: 16/9; background: #000;',
+            style: 'aspect-ratio:16/9;background:#000;',
             customAction: async (placeholderNode, match, originalUrl, service) => {
                 try {
                     const html = await gmGetText(originalUrl, 'https://www.facebook.com/');
-                    const videoUrl = extractFirstMp4FromHtml(html);
+                    const videoUrl = extractFirstMp4FromHtml(html, originalUrl);
 
-                    if (!videoUrl) {
-                        throw new Error('No MP4 found in Facebook page');
-                    }
+                    if (!videoUrl) throw new Error('No MP4 found in Facebook page');
 
                     await insertBlobVideo({
                         placeholderNode,
@@ -951,10 +1008,42 @@
             }
         },
         {
+            key: 'telegram',
+            name: 'Telegram',
+            regex: /(?:t\.me|telegram\.me)\/(?:s\/)?([a-zA-Z0-9_]+)\/(\d+)/i,
+            style: 'aspect-ratio:16/9;background:#000;',
+            customAction: async (placeholderNode, match, originalUrl, service) => {
+                const channel = match[1];
+                const postId = match[2];
+                const publicUrl = `https://t.me/${encodeURIComponent(channel)}/${encodeURIComponent(postId)}`;
+
+                try {
+                    const html = await gmGetText(publicUrl, 'https://t.me/');
+                    const videoUrl = extractFirstMp4FromHtml(html, publicUrl);
+
+                    if (!videoUrl) throw new Error('No MP4 found in Telegram page');
+
+                    await insertBlobVideo({
+                        placeholderNode,
+                        match,
+                        originalUrl,
+                        service,
+                        videoUrl,
+                        referer: 'https://t.me/',
+                        fallbackNodeFactory: () => makeTelegramIframe(channel, postId)
+                    });
+                } catch (e) {
+                    log('Telegram GM blob load failed, falling back to iframe:', e);
+                    placeholderNode.replaceWith(makeTelegramIframe(channel, postId));
+                }
+            }
+        },
+        {
+            key: 'directMp4',
             name: 'Direct MP4',
             regex: /(https?:\/\/[^\s"'<>]+\.mp4(?:\?[^\s"'<>]*)?)/i,
             isNative: true,
-            style: 'aspect-ratio: 16/9; background: #000; max-height: 550px;'
+            style: 'aspect-ratio:16/9;background:#000;max-height:550px;'
         }
     ];
 
@@ -963,28 +1052,33 @@
         return !!node.closest('[data-vidokoun-node="1"]');
     }
 
+    function getPlaceholderId(service, match) {
+        if (service.name === 'Twitter/X') return match[2];
+        if (service.name === 'Instagram') return match[2];
+        if (service.name === 'Telegram') return match[2];
+        return match[1];
+    }
+
     function createPlaceholder(service, match, originalUrl) {
-        const id = service.name === 'Twitter/X'
-            ? match[2]
-            : (service.name === 'Instagram' ? match[2] : match[1]);
+        const id = getPlaceholderId(service, match);
 
         const placeholder = document.createElement('div');
         placeholder.setAttribute('data-vidokoun-node', '1');
         placeholder.style.cssText = [
-            'position: relative;',
-            'width: 100%;',
+            'position:relative;',
+            'width:100%;',
             service.style,
-            'background-color: #1a1a1a;',
-            'border-radius: 4px;',
-            'display: flex;',
-            'align-items: center;',
-            'justify-content: center;',
-            'cursor: pointer;',
-            'box-shadow: 0 2px 8px rgba(0,0,0,0.2);',
-            'transition: background 0.2s ease;',
-            'background-position: center;',
-            'background-size: cover;'
-        ].join(' ');
+            'background-color:#1a1a1a;',
+            'border-radius:4px;',
+            'display:flex;',
+            'align-items:center;',
+            'justify-content:center;',
+            'cursor:pointer;',
+            'box-shadow:0 2px 8px rgba(0,0,0,0.2);',
+            'transition:background 0.2s ease;',
+            'background-position:center;',
+            'background-size:cover;'
+        ].join('');
 
         if (service.name === 'YouTube') {
             placeholder.style.backgroundImage = `url(https://i.ytimg.com/vi/${id}/hqdefault.jpg)`;
@@ -996,24 +1090,24 @@
         playBtn.className = 'vidokoun-play';
         playBtn.textContent = `Load ${service.name}`;
         playBtn.style.cssText = [
-            'background: rgba(0, 0, 0, 0.75);',
-            'color: #fff;',
-            'padding: 10px 20px;',
-            'border-radius: 20px;',
-            'font-family: sans-serif;',
-            'font-size: 13px;',
-            'font-weight: bold;',
-            'pointer-events: none;',
-            'border: 1px solid rgba(255,255,255,0.2);',
-            'transition: all 0.2s;'
-        ].join(' ');
+            'background:rgba(0,0,0,0.75);',
+            'color:#fff;',
+            'padding:10px 20px;',
+            'border-radius:20px;',
+            'font-family:sans-serif;',
+            'font-size:13px;',
+            'font-weight:bold;',
+            'pointer-events:none;',
+            'border:1px solid rgba(255,255,255,0.2);',
+            'transition:all 0.2s;'
+        ].join('');
 
         placeholder.onmouseenter = () => {
-            playBtn.style.background = 'rgba(180, 0, 0, 0.9)';
+            playBtn.style.background = 'rgba(180,0,0,0.9)';
         };
 
         placeholder.onmouseleave = () => {
-            playBtn.style.background = 'rgba(0, 0, 0, 0.75)';
+            playBtn.style.background = 'rgba(0,0,0,0.75)';
         };
 
         placeholder.appendChild(playBtn);
@@ -1025,7 +1119,7 @@
 
             this.dataset.vidokounLoading = '1';
             playBtn.textContent = 'Loading...';
-            playBtn.style.background = 'rgba(100, 100, 100, 0.9)';
+            playBtn.style.background = 'rgba(100,100,100,0.9)';
 
             if (service.customAction) {
                 await service.customAction(this, match, originalUrl, service);
@@ -1036,12 +1130,12 @@
             iframe.setAttribute('data-vidokoun-node', '1');
             iframe.src = service.getEmbedUrl(id);
             iframe.style.cssText = [
-                'width: 100%;',
+                'width:100%;',
                 service.style,
-                'border: none;',
-                'border-radius: 4px;',
-                'background: white;'
-            ].join(' ');
+                'border:none;',
+                'border-radius:4px;',
+                'background:white;'
+            ].join('');
             iframe.allowFullscreen = true;
             iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture';
 
@@ -1058,14 +1152,7 @@
         sourceLink.target = '_blank';
         sourceLink.rel = 'noopener noreferrer';
         sourceLink.textContent = `[ Open original ${serviceName} link ]`;
-        sourceLink.style.cssText = [
-            'align-self: flex-end;',
-            'margin-top: 6px;',
-            'font-size: 11px;',
-            'color: #888;',
-            'text-decoration: none;',
-            'font-family: sans-serif;'
-        ].join(' ');
+        sourceLink.style.cssText = 'align-self:flex-end;margin-top:6px;font-size:11px;color:#888;text-decoration:none;font-family:sans-serif;';
 
         sourceLink.onmouseenter = () => {
             sourceLink.style.color = '#ccc';
@@ -1090,6 +1177,8 @@
         if (!url) return;
 
         for (const service of services) {
+            if (!isServiceEnabled(service.key)) continue;
+
             const match = url.match(service.regex);
             if (!match) continue;
 
@@ -1099,11 +1188,11 @@
             const wrapper = document.createElement('div');
             wrapper.setAttribute('data-vidokoun-node', '1');
             wrapper.style.cssText = [
-                'margin: 12px 0;',
-                `max-width: ${MAX_WIDTH};`,
-                'display: flex;',
-                'flex-direction: column;'
-            ].join(' ');
+                'margin:12px 0;',
+                `max-width:${MAX_WIDTH};`,
+                'display:flex;',
+                'flex-direction:column;'
+            ].join('');
 
             if (service.isNative) {
                 const video = document.createElement('video');
@@ -1113,11 +1202,11 @@
                 video.preload = 'none';
                 video.playsInline = true;
                 video.style.cssText = [
-                    'width: 100%;',
+                    'width:100%;',
                     service.style,
-                    'border-radius: 4px;',
-                    'box-shadow: 0 2px 8px rgba(0,0,0,0.2);'
-                ].join(' ');
+                    'border-radius:4px;',
+                    'box-shadow:0 2px 8px rgba(0,0,0,0.2);'
+                ].join('');
                 wrapper.appendChild(video);
             } else {
                 wrapper.appendChild(createPlaceholder(service, match, url));
@@ -1136,11 +1225,8 @@
             log('embedded', service.name, url);
             return;
         }
-
-        link.dataset.vidokounDone = '1';
     }
 
-    
     function processRoot(root) {
         if (!root) return;
         if (root.nodeType !== 1) return;
