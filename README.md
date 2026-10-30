@@ -1,4 +1,16 @@
-# vidokoun
+<div align="center">
+  <img src="assets/vidokoun-youtube-banner.png" width="900" alt="Pixel-art Okoun fish watching a video on a phone">
+  <h1>vidokoun</h1>
+  <a href="https://raw.githubusercontent.com/hanenashi/vidokoun/main/okoun-youtube-tab.user.js"><img alt="Install YouTube fullscreen companion script" src="https://img.shields.io/badge/Install-YouTube%20fullscreen%20companion-c00?style=for-the-badge"></a>
+</div>
+
+## YouTube fullscreen companion
+
+The [YouTube fullscreen companion userscript](okoun-youtube-tab.user.js) opens Okoun's YouTube previews in a separate YouTube tab. Tap its **Landscape fullscreen** button to play the video in fullscreen; your browser's Back button returns to Okoun. It avoids the misplaced fullscreen view that embedded YouTube videos can show in Kiwi on Android.
+
+Install it using the button above in your userscript manager. Its `@updateURL` and `@downloadURL` point to this repository's `main` branch, so the manager can check for future versions. The icon also loads from this repository. This companion is separate from the inline-player script documented below.
+
+## Inline-player userscript
 
 **[Install vidokoun Userscript](https://raw.githubusercontent.com/hanenashi/vidokoun/main/vidokoun.user.js)**  
 *(Requires a userscript manager. Tested mainly with Tampermonkey/Kiwi on Android and desktop Chromium-style browsers. Firefox/Greasemonkey-style `GM.xmlHttpRequest` is supported through a compatibility wrapper.)*
