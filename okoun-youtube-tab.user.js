@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Okoun YouTube: open in tab
 // @namespace    https://github.com/hanenashi/vidokoun
-// @version      0.1.2
+// @version      0.1.3
 // @description  Open Okoun YouTube previews directly, with a landscape fullscreen button on the watch page.
 // @icon         https://raw.githubusercontent.com/hanenashi/vidokoun/main/assets/vidokoun-youtube-icon.png
 // @updateURL    https://raw.githubusercontent.com/hanenashi/vidokoun/main/okoun-youtube-tab.user.js
@@ -76,24 +76,69 @@
     boxShadow: '0 3px 16px #0009',
   });
 
-  button.addEventListener('click', () => {
+  button.addEventListener('click', async () => {
     const video = document.querySelector('video');
     if (!video) {
       button.textContent = 'Video still loading — tap again';
       return;
     }
 
-    const fullscreenControl = document.querySelector(
-      '.player-controls-bottom .fullscreen-icon, .ytp-fullscreen-button'
-    );
-    if (!fullscreenControl) {
-      button.textContent = 'YouTube controls still loading — tap again';
-      return;
-    }
+    const oldControls = video.controls;
+    const oldFit = video.style.objectFit;
+    const oldBackground = video.style.backgroundColor;
+    let lastTap = null;
 
-    // Let YouTube fullscreen its player so its controls and double-tap seeking stay available.
-    fullscreenControl.click();
-    button.remove();
+    const onTouchEnd = (event) => {
+      if (document.fullscreenElement !== video || event.changedTouches.length !== 1 || event.touches.length) return;
+      const touch = event.changedTouches[0];
+      const rect = video.getBoundingClientRect();
+      if (touch.clientY > rect.top + rect.height * 0.8) return; // Leave the native control bar alone.
+      const side = touch.clientX < rect.left + rect.width / 3 ? -1
+        : touch.clientX > rect.right - rect.width / 3 ? 1 : 0;
+      if (!side) return;
+
+      const now = Date.now();
+      if (lastTap && lastTap.side === side && now - lastTap.time < 350 &&
+          Math.abs(touch.clientX - lastTap.x) < 100) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        const wasPlaying = lastTap.wasPlaying;
+        lastTap = null;
+        const target = video.currentTime + side * 10;
+        const end = Number.isFinite(video.duration) ? video.duration : Infinity;
+        video.currentTime = Math.max(0, Math.min(end, target));
+        if (wasPlaying && video.paused) video.play().catch(() => {});
+      } else {
+        lastTap = { side, x: touch.clientX, time: now, wasPlaying: !video.paused };
+      }
+    };
+
+    const restore = () => {
+      video.controls = oldControls;
+      video.style.objectFit = oldFit;
+      video.style.backgroundColor = oldBackground;
+      video.removeEventListener('touchend', onTouchEnd, true);
+      document.removeEventListener('fullscreenchange', onFullscreenChange);
+    };
+    const onFullscreenChange = () => {
+      if (document.fullscreenElement !== video) restore();
+    };
+
+    video.controls = true;
+    video.style.objectFit = 'contain';
+    video.style.backgroundColor = 'black';
+    video.addEventListener('touchend', onTouchEnd, { capture: true, passive: false });
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+
+    try {
+      await video.requestFullscreen();
+      screen.orientation?.lock?.('landscape').catch(() => {});
+      video.play().catch(() => {});
+      button.remove();
+    } catch {
+      restore();
+      button.textContent = 'Fullscreen blocked — use YouTube’s button';
+    }
   });
 
   const showButton = () => document.body?.append(button);

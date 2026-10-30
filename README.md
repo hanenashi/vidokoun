@@ -6,7 +6,7 @@
 
 ## YouTube fullscreen companion
 
-The [YouTube fullscreen companion userscript](okoun-youtube-tab.user.js) opens Okoun's YouTube previews in a separate YouTube tab. Tap its **Landscape fullscreen** button to enter YouTube's own fullscreen player, with its controls and double-tap seeking; your browser's Back button returns to Okoun. It avoids the misplaced fullscreen view that embedded YouTube videos can show in Kiwi on Android.
+The [YouTube fullscreen companion userscript](okoun-youtube-tab.user.js) opens Okoun's YouTube previews in a separate YouTube tab. Tap its **Landscape fullscreen** button to enter a centered video fullscreen view with browser playback controls. Double-tap the left or right side to seek back or forward 10 seconds; your browser's Back button returns to Okoun. This avoids the misplaced YouTube player fullscreen view in Kiwi on Android.
 
 Install it using the button above in your userscript manager. Its `@updateURL` and `@downloadURL` point to this repository's `main` branch, so the manager can check for future versions. The icon also loads from this repository. This companion is separate from the inline-player script documented below.
 
