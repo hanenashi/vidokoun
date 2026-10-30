@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Okoun YouTube: open in tab
 // @namespace    https://github.com/hanenashi/vidokoun
-// @version      0.1.1
+// @version      0.1.2
 // @description  Open Okoun YouTube previews directly, with a landscape fullscreen button on the watch page.
 // @icon         https://raw.githubusercontent.com/hanenashi/vidokoun/main/assets/vidokoun-youtube-icon.png
 // @updateURL    https://raw.githubusercontent.com/hanenashi/vidokoun/main/okoun-youtube-tab.user.js
@@ -76,37 +76,24 @@
     boxShadow: '0 3px 16px #0009',
   });
 
-  button.addEventListener('click', async () => {
+  button.addEventListener('click', () => {
     const video = document.querySelector('video');
     if (!video) {
       button.textContent = 'Video still loading — tap again';
       return;
     }
 
-    const oldFit = video.style.objectFit;
-    const oldBackground = video.style.backgroundColor;
-    const restoreVideoStyle = () => {
-      video.style.objectFit = oldFit;
-      video.style.backgroundColor = oldBackground;
-    };
-    const onFullscreenChange = () => {
-      if (document.fullscreenElement === video) return;
-      restoreVideoStyle();
-      document.removeEventListener('fullscreenchange', onFullscreenChange);
-    };
-    video.style.objectFit = 'contain';
-    video.style.backgroundColor = 'black';
-
-    try {
-      await video.requestFullscreen();
-      document.addEventListener('fullscreenchange', onFullscreenChange);
-      screen.orientation?.lock?.('landscape').catch(() => {});
-      video.play().catch(() => {});
-      button.remove();
-    } catch {
-      restoreVideoStyle();
-      button.textContent = 'Fullscreen blocked — use YouTube’s button';
+    const fullscreenControl = document.querySelector(
+      '.player-controls-bottom .fullscreen-icon, .ytp-fullscreen-button'
+    );
+    if (!fullscreenControl) {
+      button.textContent = 'YouTube controls still loading — tap again';
+      return;
     }
+
+    // Let YouTube fullscreen its player so its controls and double-tap seeking stay available.
+    fullscreenControl.click();
+    button.remove();
   });
 
   const showButton = () => document.body?.append(button);
